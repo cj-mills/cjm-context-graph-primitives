@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cjm-context-graph-primitives"
+dynamic = ["version"]
+description = "The dep-light data-primitives library for the cjm context-graph ecosystem — defines the shared data nouns that workflow cores, graph-storage adapters, provenance bundles, and the graph-aware composition layer all speak: structured resource locators with canonical URI rendering, content-hash-primary SourceRef provenance references, atomic typed content slices, GraphNode/GraphEdge/GraphContext containers, and the structured typed query expression executed by graph-storage adapters."
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "Apache-2.0"}
+authors = [{name = "Christian J. Mills", email = "9126128+cj-mills@users.noreply.github.com"}]
+keywords = ['nbdev']
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/cj-mills/cjm-context-graph-primitives"
+Documentation = "https://cj-mills.github.io/cjm-context-graph-primitives/"
+
+[project.entry-points.nbdev]
+cjm_context_graph_primitives = "cjm_context_graph_primitives._modidx:d"
+
+[tool.setuptools.dynamic]
+version = {attr = "cjm_context_graph_primitives.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["cjm_context_graph_primitives"]
+
+[tool.nbdev]

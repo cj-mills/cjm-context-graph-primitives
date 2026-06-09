@@ -1,0 +1,9 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "cjm-context-graph-primitives"
+  site-url: "https://cj-mills.github.io/cjm-context-graph-primitives"
+  description: "The dep-light data-primitives library for the cjm context-graph ecosystem — defines the shared data nouns that workflow cores, graph-storage adapters, provenance bundles, and the graph-aware composition layer all speak: structured resource locators with canonical URI rendering, content-hash-primary SourceRef provenance references, atomic typed content slices, GraphNode/GraphEdge/GraphContext containers, and the structured typed query expression executed by graph-storage adapters."
+  repo-branch: main
+  repo-url: "https://github.com/cj-mills/cjm-context-graph-primitives"
