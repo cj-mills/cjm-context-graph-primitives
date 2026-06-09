@@ -15,7 +15,9 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
 ]
-dependencies = []
+dependencies = [
+    "cjm_plugin_system>=0.0.39",
+]
 
 [project.urls]
 Repository = "https://github.com/cj-mills/cjm-context-graph-primitives"
@@ -28,6 +30,6 @@ cjm_context_graph_primitives = "cjm_context_graph_primitives._modidx:d"
 version = {attr = "cjm_context_graph_primitives.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["cjm_context_graph_primitives"]
+include = ["cjm_context_graph_primitives*"]
 
 [tool.nbdev]

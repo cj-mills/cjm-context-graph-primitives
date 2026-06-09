@@ -8,3 +8,802 @@
 ``` bash
 pip install cjm_context_graph_primitives
 ```
+
+## Usage
+
+``` python
+from cjm_context_graph_primitives.locators import FileRef
+from cjm_context_graph_primitives.slices import CharSlice
+from cjm_context_graph_primitives.provenance import SourceRef
+
+# A provenance reference: identity is the content hash (primary); the locator
+# may dangle without breaking verifiability; the slice kind selects the facet.
+text = "It's one small step for man,"
+ref = SourceRef(
+    locator=FileRef(path="/runs/run_x.json"),
+    content_hash=SourceRef.compute_hash(text.encode()),
+    slice=CharSlice(25, 53),
+)
+print(ref)                        # canonical string: locator#slice@hash
+print(ref.verify(text.encode()))  # hash-based verify, locator-independent
+```
+
+``` python
+from cjm_context_graph_primitives.query import NodeQuery, RelationPredicate, OrderBy
+
+# A typed, portable, scale-shaped graph read (executed by a storage adapter):
+spine = NodeQuery(
+    label="Segment",
+    related=RelationPredicate(relation_type="PART_OF", node_id="doc-1"),
+    order_by=OrderBy(prop="index"),
+    project=["index", "text", "start_time", "end_time"],
+    limit=100,
+)
+spine.to_dict()["type"]
+```
+
+## Project Structure
+
+    nbs/
+    ├── graph.ipynb      # The graph data nouns — `GraphNode` / `GraphEdge` / `GraphContext`. Moved here from `cjm-graph-plugin-system` per the data-nouns-vs-storage-verbs split (pass-2 Thread 2): every consumer of graph DATA (workflow cores, bundles, the CR-18 graph-aware layer, the storage adapter itself) depends on this library; only persistence depends on the storage adapter. `GraphContext` satisfies the substrate's `FileBackedDTO` protocol (`to_temp_file`) for zero-copy worker transfer.
+    ├── locators.ipynb   # Structured resource locators — the typed sum type addressing WHERE referenced content lives (CR-19). A locator renders a canonical URI string for the things strings are good at (grep, logs, cache keys, display) while keeping typed field access primary; unknown kinds round-trip losslessly for forward compatibility.
+    ├── provenance.ipynb # `SourceRef` — the cross-cutting provenance reference (CR-19). **Identity = `content_hash` (PRIMARY); location = `locator`; region = optional atomic typed `slice`.** `verify()` is hash-based regardless of whether the locator still resolves — the structural fix for dangling row-id provenance (cache-hit rows; ledgers E13/D3).
+    ├── query.ipynb      # The structured typed query expression (pass-2 Thread 5) — DATA nouns describing graph reads. **Execution lives in graph-storage adapters** (stage 4 translates expressions per-backend); this library only defines, validates, and (de)serializes them. Typed expressions are the primary, portable surface — no storage-schema leak (the raw-SQL `nodes`/`edges` + `json_extract` coupling of ledger C2/C3), and scale-shaped (server-side filter/page/count answering D13). `RawQuery` is the explicitly-marked, backend-coupled escape hatch: recurring raw patterns EXPOSE missing typed-expression capabilities and get PROMOTED into the typed surface (the real-world-testing forcing function).
+    └── slices.ipynb     # Atomic typed content slices — WHAT REGION of the located resource a reference consumes. The slice KIND selects the content facet on multi-facet nodes (`TimeSlice` → audio, `CharSlice` → text), which dissolves the chunk-local-vs-source-coordinate ambiguity without a frame field (pass-2 Thread 2).
+
+Total: 5 notebooks
+
+## Module Dependencies
+
+``` mermaid
+graph LR
+    graph_mod["graph<br/>graph"]
+    locators["locators<br/>locators"]
+    provenance["provenance<br/>provenance"]
+    query["query<br/>query"]
+    slices["slices<br/>slices"]
+
+    graph_mod --> provenance
+    graph_mod --> locators
+    graph_mod --> slices
+    provenance --> locators
+    provenance --> slices
+    query --> locators
+```
+
+*6 cross-module dependencies detected*
+
+## CLI Reference
+
+No CLI commands found in this project.
+
+## Module Overview
+
+Detailed documentation for each module in the project:
+
+### graph (`graph.ipynb`)
+
+> The graph data nouns — `GraphNode` / `GraphEdge` / `GraphContext`.
+> Moved here from `cjm-graph-plugin-system` per the
+> data-nouns-vs-storage-verbs split (pass-2 Thread 2): every consumer of
+> graph DATA (workflow cores, bundles, the CR-18 graph-aware layer, the
+> storage adapter itself) depends on this library; only persistence
+> depends on the storage adapter. `GraphContext` satisfies the
+> substrate’s `FileBackedDTO` protocol (`to_temp_file`) for zero-copy
+> worker transfer.
+
+#### Import
+
+``` python
+from cjm_context_graph_primitives.graph import (
+    GraphNode,
+    GraphEdge,
+    GraphContext
+)
+```
+
+#### Classes
+
+``` python
+@dataclass
+class GraphNode:
+    """
+    An entity in a context graph.
+    
+    `sources` carries the node's provenance references (multiple refs per node:
+    e.g. a fine Segment carries an audio ref and a text ref — the slice kind
+    selects the facet).
+    """
+    
+    id: str  # UUID
+    label: str  # e.g. "Source", "Segment", "Correction"
+    properties: Dict[str, Any] = field(...)  # Arbitrary domain payload
+    sources: List[SourceRef] = field(...)  # Provenance references
+    created_at: Optional[float]  # Unix timestamp when created
+    updated_at: Optional[float]  # Unix timestamp when last updated
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict with nested source dicts
+            """Serialize to the wire dict form."""
+            return {
+                "id": self.id,
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            data: Dict[str, Any]  # Wire dict (nested source dicts or SourceRef instances)
+        ) -> "GraphNode":  # Reconstructed node
+        "Reconstruct from the wire dict form (single authority — storage adapters
+and `GraphContext` both route through here rather than re-implementing)."
+```
+
+``` python
+@dataclass
+class GraphEdge:
+    """
+    A relationship between two nodes. Composition is ALWAYS edges — grouping,
+    chains, supersession, and provenance topology all live here, never in
+    multi-range slices or per-ref chain fields.
+    """
+    
+    id: str  # UUID
+    source_id: str  # Origin node UUID
+    target_id: str  # Destination node UUID
+    relation_type: str  # e.g. "NEXT", "PART_OF", "CORRECTS", "DERIVED_FROM"
+    properties: Dict[str, Any] = field(...)  # Arbitrary metadata
+    created_at: Optional[float]  # Unix timestamp when created
+    updated_at: Optional[float]  # Unix timestamp when last updated
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict
+            """Serialize to the wire dict form."""
+            return {
+                "id": self.id,
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            data: Dict[str, Any]  # Wire dict
+        ) -> "GraphEdge":  # Reconstructed edge
+        "Reconstruct from the wire dict form."
+```
+
+``` python
+@dataclass
+class GraphContext:
+    """
+    Container for graph read results (a subgraph).
+    
+    Satisfies the substrate's `FileBackedDTO` protocol via `to_temp_file` for
+    zero-copy transfer across the worker boundary.
+    """
+    
+    nodes: List[GraphNode]  # Nodes in the subgraph
+    edges: List[GraphEdge]  # Edges in the subgraph
+    metadata: Dict[str, Any] = field(...)  # Query metadata, stats, etc.
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict
+            """Serialize to the wire dict form."""
+            return {
+                "nodes": [n.to_dict() for n in self.nodes],
+        "Serialize to the wire dict form."
+    
+    def to_temp_file(self) -> str:  # Absolute path to a temporary JSON file
+            """Save to a temp file for zero-copy transfer (FileBackedDTO)."""
+            tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
+            json.dump(self.to_dict(), tmp)
+            tmp.close()
+            return str(Path(tmp.name).absolute())
+    
+        @classmethod
+        def from_dict(
+            cls,
+            data: Dict[str, Any]  # Wire dict with nodes, edges, metadata
+        ) -> "GraphContext":  # Reconstructed context
+        "Save to a temp file for zero-copy transfer (FileBackedDTO)."
+    
+    def from_dict(
+            cls,
+            data: Dict[str, Any]  # Wire dict with nodes, edges, metadata
+        ) -> "GraphContext":  # Reconstructed context
+        "Reconstruct from the wire dict form."
+    
+    def from_file(
+            cls,
+            filepath: str  # Path to a JSON file produced by `to_temp_file`
+        ) -> "GraphContext":  # Reconstructed context
+        "Load from a JSON file."
+```
+
+### locators (`locators.ipynb`)
+
+> Structured resource locators — the typed sum type addressing WHERE
+> referenced content lives (CR-19). A locator renders a canonical URI
+> string for the things strings are good at (grep, logs, cache keys,
+> display) while keeping typed field access primary; unknown kinds
+> round-trip losslessly for forward compatibility.
+
+#### Import
+
+``` python
+from cjm_context_graph_primitives.locators import (
+    ResourceLocator,
+    LOCATOR_KINDS,
+    GraphNodeRef,
+    FileRef,
+    UnknownLocator,
+    locator_from_dict
+)
+```
+
+#### Functions
+
+``` python
+def locator_from_dict(
+    d: Dict[str, Any]  # Wire dict with a "kind" discriminator
+) -> ResourceLocator:  # Typed locator; unknown kinds round-trip as UnknownLocator
+    """
+    Reconstruct a locator from its wire dict.
+    
+    Unknown kinds are preserved losslessly as `UnknownLocator`. Known kinds are
+    strict: a payload mismatch (extra/missing fields) raises, because additive
+    evolution of a known kind must land in this library, not be silently dropped.
+    """
+```
+
+#### Classes
+
+``` python
+class GraphNodeRef:
+    """
+    Locator for a node in a context graph.
+    
+    `graph_id=None` means the current graph (intra-graph reference). A non-None
+    `graph_id` addresses a node in another graph — cross-graph references become
+    real with provenance bundles (CR-20); the field exists now so the wire shape
+    does not change when they do.
+    """
+    
+    def to_uri(self) -> str:  # Canonical URI, e.g. "graph-node:<node_id>" or "graph-node:<graph_id>/<node_id>"
+            """Render the canonical URI form."""
+            if self.graph_id
+        "Render the canonical URI form."
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict with "kind" discriminator
+            """Serialize to the wire dict form."""
+            return {"kind": self.KIND, "node_id": self.node_id, "graph_id": self.graph_id}
+        "Serialize to the wire dict form."
+```
+
+``` python
+class FileRef:
+    """
+    Locator for a filesystem artifact (e.g. a consumed run manifest).
+    
+    The path is stored raw and rendered raw — the URI form is a display/grep
+    canonical string, not an RFC 3986 URI (no percent-encoding; corpus paths
+    contain spaces).
+    """
+    
+    def to_uri(self) -> str:  # Canonical URI, e.g. "file:/abs/path"
+            """Render the canonical URI form."""
+            return f"{self.KIND}:{self.path}"
+    
+        def __str__(self) -> str:  # Same as `to_uri`
+        "Render the canonical URI form."
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict with "kind" discriminator
+            """Serialize to the wire dict form."""
+            return {"kind": self.KIND, "path": self.path}
+        "Serialize to the wire dict form."
+```
+
+``` python
+class UnknownLocator:
+    """
+    Lossless carrier for a locator kind this library version does not know.
+    
+    Forward-compatibility law (CR-19): consumers must round-trip locator kinds
+    they cannot interpret — a shared bundle from a newer ecosystem version (or a
+    future source type) keeps its references intact, and `SourceRef.content_hash`
+    still verifies the content behind an un-understood locator. `data` preserves
+    the original payload verbatim (minus the "kind" discriminator).
+    
+    Not hashable in practice (carries a dict); known-kind locators are the
+    value-object path.
+    """
+    
+    def to_uri(self) -> str:  # Best-effort canonical URI: "<kind>:<canonical-json>"
+            """Render a deterministic best-effort URI form."""
+            canonical = json.dumps(self.data, sort_keys=True, separators=(",", ":"))
+            return f"{self.kind}:{canonical}"
+    
+        def __str__(self) -> str:  # Same as `to_uri`
+        "Render a deterministic best-effort URI form."
+    
+    def to_dict(self) -> Dict[str, Any]:  # The original wire dict, reconstructed verbatim
+            """Serialize back to the original wire dict form."""
+            return {"kind": self.kind, **self.data}
+        "Serialize back to the original wire dict form."
+```
+
+#### Variables
+
+``` python
+ResourceLocator  # The locator sum type
+LOCATOR_KINDS: Dict[str, type]
+```
+
+### provenance (`provenance.ipynb`)
+
+> `SourceRef` — the cross-cutting provenance reference (CR-19).
+> **Identity = `content_hash` (PRIMARY); location = `locator`; region =
+> optional atomic typed `slice`.** `verify()` is hash-based regardless
+> of whether the locator still resolves — the structural fix for
+> dangling row-id provenance (cache-hit rows; ledgers E13/D3).
+
+#### Import
+
+``` python
+from cjm_context_graph_primitives.provenance import (
+    SourceRef
+)
+```
+
+#### Classes
+
+``` python
+class SourceRef:
+    """
+    A provenance reference to (a region of) a resource.
+    
+    Replaces the old plugin_name/table_name/row_id/segment_slice shape: the
+    locator is a structured sum type (no `external:<path>` string abuse), the
+    hash is primary identity, and the slice is typed and atomic.
+    """
+    
+    def to_uri(self) -> str:  # Canonical string: "<locator-uri>[#<slice-string>]@<content_hash>"
+            """Render the complete canonical string form (grep-able by locator, slice, or hash)."""
+            base = self.locator.to_uri()
+            if self.slice is not None
+        "Render the complete canonical string form (grep-able by locator, slice, or hash)."
+    
+    def to_dict(self) -> Dict[str, Any]:  # Nested wire dict
+            """Serialize to the wire dict form."""
+            return {
+                "locator": self.locator.to_dict(),
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            d: Dict[str, Any]  # Wire dict with nested locator/slice dicts
+        ) -> "SourceRef":  # Reconstructed reference (unknown locator/slice kinds round-trip)
+        "Reconstruct from the wire dict form."
+    
+    def verify(
+            self,
+            current_content: bytes  # Current bytes of the CONSUMED (sliced) content
+        ) -> bool:  # True if content still matches the stored hash
+        "Hash-verify content — works even when the locator no longer resolves."
+    
+    def compute_hash(
+            content: bytes,       # Content to hash
+            algo: str = "sha256"  # Hash algorithm name
+        ) -> str:  # Hash string in "algo:hexdigest" format
+        "Compute a content hash for use in a SourceRef."
+```
+
+### query (`query.ipynb`)
+
+> The structured typed query expression (pass-2 Thread 5) — DATA nouns
+> describing graph reads. **Execution lives in graph-storage adapters**
+> (stage 4 translates expressions per-backend); this library only
+> defines, validates, and (de)serializes them. Typed expressions are the
+> primary, portable surface — no storage-schema leak (the raw-SQL
+> `nodes`/`edges` + `json_extract` coupling of ledger C2/C3), and
+> scale-shaped (server-side filter/page/count answering D13). `RawQuery`
+> is the explicitly-marked, backend-coupled escape hatch: recurring raw
+> patterns EXPOSE missing typed-expression capabilities and get PROMOTED
+> into the typed surface (the real-world-testing forcing function).
+
+#### Import
+
+``` python
+from cjm_context_graph_primitives.query import (
+    PREDICATE_OPS,
+    RELATION_DIRECTIONS,
+    QUERY_TYPES,
+    PropertyPredicate,
+    SourcePredicate,
+    RelationPredicate,
+    OrderBy,
+    NodeQuery,
+    EdgeQuery,
+    RawQuery,
+    query_from_dict
+)
+```
+
+#### Functions
+
+``` python
+def query_from_dict(
+    d: Dict[str, Any]  # Tagged wire dict ("type" in QUERY_TYPES)
+) -> Any:  # NodeQuery | EdgeQuery | RawQuery
+    "Reconstruct a query expression from its tagged wire dict."
+```
+
+#### Classes
+
+``` python
+class PropertyPredicate:
+    "One property comparison; a query's `where` list combines predicates with AND."
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict
+            """Serialize to the wire dict form."""
+            return {"prop": self.prop, "op": self.op, "value": self.value}
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            d: Dict[str, Any]  # Wire dict
+        ) -> "PropertyPredicate":  # Reconstructed predicate
+        "Reconstruct from the wire dict form."
+```
+
+``` python
+class SourcePredicate:
+    """
+    Match nodes whose `sources` contain a reference matching by content hash
+    and/or locator — the typed form of the reverse provenance index
+    (`find_prior_corrections_by_hash`-style reads; identity-first per CR-19).
+    """
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict
+            """Serialize to the wire dict form."""
+            return {
+                "content_hash": self.content_hash,
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            d: Dict[str, Any]  # Wire dict
+        ) -> "SourcePredicate":  # Reconstructed predicate
+        "Reconstruct from the wire dict form."
+```
+
+``` python
+class RelationPredicate:
+    """
+    Match nodes that have an edge of `relation_type` (one-hop, typed traversal —
+    e.g. "Segments PART_OF document D"). Depth-N neighborhood reads stay on
+    `get_context`; richer traversal expressions wait for adopter evidence.
+    """
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict
+            """Serialize to the wire dict form."""
+            return {"relation_type": self.relation_type, "direction": self.direction,
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            d: Dict[str, Any]  # Wire dict
+        ) -> "RelationPredicate":  # Reconstructed predicate
+        "Reconstruct from the wire dict form."
+```
+
+``` python
+class OrderBy:
+    "Result ordering by one property (server-side; C2/C3 ORDER BY index)."
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict
+            """Serialize to the wire dict form."""
+            return {"prop": self.prop, "descending": self.descending}
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            d: Dict[str, Any]  # Wire dict
+        ) -> "OrderBy":  # Reconstructed ordering
+        "Reconstruct from the wire dict form."
+```
+
+``` python
+@dataclass
+class NodeQuery:
+    """
+    Typed node read: filter / traverse / order / page / project / count.
+    
+    All filter fields combine with AND. `count=True` returns a count instead of
+    rows (the D13 verify-spine aggregate shape). `project` limits returned
+    properties (server-side projection; None = whole nodes).
+    """
+    
+    ids: Optional[List[str]]  # Batch-by-id (C17); None = no id filter
+    label: Optional[str]  # Node label filter
+    where: List[PropertyPredicate] = field(...)  # Property predicates (AND)
+    source: Optional[SourcePredicate]  # Provenance reverse-index match
+    related: Optional[RelationPredicate]  # One-hop relation constraint
+    order_by: Optional[OrderBy]  # Server-side ordering
+    limit: Optional[int]  # Page size; None = backend default
+    offset: int = 0  # Page offset
+    count: bool = False  # Return count instead of rows
+    project: Optional[List[str]]  # Property names to return; None = whole nodes
+    
+    def to_dict(self) -> Dict[str, Any]:  # Tagged wire dict
+            """Serialize to the wire dict form."""
+            return {
+                "type": self.TYPE,
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            d: Dict[str, Any]  # Tagged wire dict
+        ) -> "NodeQuery":  # Reconstructed query
+        "Reconstruct from the wire dict form."
+```
+
+``` python
+@dataclass
+class EdgeQuery:
+    """
+    Typed edge read: filter / order / page / project / count.
+    
+    Covers the cores' edge reads: counting edges by relation type for a spine
+    (D13 verify aggregates) and reading edge properties off a node's edges
+    (correction decisions).
+    """
+    
+    ids: Optional[List[str]]  # Batch-by-id; None = no id filter
+    relation_type: Optional[str]  # Edge relation-type filter
+    source_id: Optional[str]  # Origin node filter
+    target_id: Optional[str]  # Destination node filter
+    where: List[PropertyPredicate] = field(...)  # Property predicates (AND)
+    order_by: Optional[OrderBy]  # Server-side ordering
+    limit: Optional[int]  # Page size; None = backend default
+    offset: int = 0  # Page offset
+    count: bool = False  # Return count instead of rows
+    project: Optional[List[str]]  # Property names to return; None = whole edges
+    
+    def to_dict(self) -> Dict[str, Any]:  # Tagged wire dict
+            """Serialize to the wire dict form."""
+            return {
+                "type": self.TYPE,
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            d: Dict[str, Any]  # Tagged wire dict
+        ) -> "EdgeQuery":  # Reconstructed query
+        "Reconstruct from the wire dict form."
+```
+
+``` python
+@dataclass
+class RawQuery:
+    """
+    The explicitly-marked, backend-coupled escape hatch.
+    
+    For reads the typed expressions cannot yet express. `backend` is REQUIRED —
+    a raw query is non-portable by construction and an executor must refuse a
+    backend mismatch. Recurring raw patterns are promotion candidates into the
+    typed surface (record them; that is the forcing function).
+    """
+    
+    text: str  # Backend-native query text (e.g. SQL)
+    backend: str  # Backend this query is coupled to (e.g. "sqlite"); executors refuse mismatches
+    params: Any = field(...)  # Positional list or named dict of parameters
+    
+    def to_dict(self) -> Dict[str, Any]:  # Tagged wire dict
+            """Serialize to the wire dict form."""
+            return {"type": self.TYPE, "text": self.text, "backend": self.backend,
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            d: Dict[str, Any]  # Tagged wire dict
+        ) -> "RawQuery":  # Reconstructed query
+        "Reconstruct from the wire dict form."
+```
+
+#### Variables
+
+``` python
+PREDICATE_OPS  # Reserved operator vocabulary (executors may implement a subset but MUST raise on unsupported ops)
+RELATION_DIRECTIONS  # Edge direction relative to the candidate node
+QUERY_TYPES: Dict[str, type]
+```
+
+### slices (`slices.ipynb`)
+
+> Atomic typed content slices — WHAT REGION of the located resource a
+> reference consumes. The slice KIND selects the content facet on
+> multi-facet nodes (`TimeSlice` → audio, `CharSlice` → text), which
+> dissolves the chunk-local-vs-source-coordinate ambiguity without a
+> frame field (pass-2 Thread 2).
+
+#### Import
+
+``` python
+from cjm_context_graph_primitives.slices import (
+    TypedSlice,
+    SLICE_KINDS,
+    CharSlice,
+    TimeSlice,
+    FrameSlice,
+    LineSlice,
+    PageSlice,
+    FullContent,
+    UnknownSlice,
+    slice_from_dict,
+    parse_slice
+)
+```
+
+#### Functions
+
+``` python
+def slice_from_dict(
+    d: Dict[str, Any]  # Wire dict with a "kind" discriminator
+) -> TypedSlice:  # Typed slice; unknown kinds round-trip as UnknownSlice
+    """
+    Reconstruct a typed slice from its wire dict.
+    
+    Unknown kinds are preserved losslessly as `UnknownSlice`; known kinds are
+    strict (mirror of `locator_from_dict`).
+    """
+```
+
+``` python
+def parse_slice(
+    s: str  # Canonical slice string (e.g. "char:0-500", "time:6.6-9.8", "full:audio")
+) -> TypedSlice:  # Parsed typed slice
+    """
+    Parse a canonical slice string into a typed slice.
+    
+    Convenience for KNOWN kinds only (CLI args, display strings); the wire-dict
+    path (`slice_from_dict`) is the forward-compatible one. Unknown kinds raise.
+    """
+```
+
+#### Classes
+
+``` python
+class CharSlice:
+    "Character-range slice into a text facet."
+    
+    def to_slice_string(self) -> str:  # e.g. "char:0-500"
+            """Render the canonical slice string."""
+            return f"{self.KIND}:{self.start}-{self.end}"
+    
+        def __str__(self) -> str:  # Same as `to_slice_string`
+        "Render the canonical slice string."
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict with "kind" discriminator
+            """Serialize to the wire dict form."""
+            return {"kind": self.KIND, "start": self.start, "end": self.end}
+        "Serialize to the wire dict form."
+```
+
+``` python
+class TimeSlice:
+    """
+    Temporal slice into an audio/video facet, in seconds.
+    
+    SINGLE-RANGE by the atomic-slice law: a fine Segment's audio ref is always
+    exactly one VAD chunk; segmentation corrections move TEXT across fixed
+    boundaries and never produce a multi-chunk span (where-graph-begins,
+    locked 2026-06-08).
+    """
+    
+    def to_slice_string(self) -> str:  # e.g. "time:6.6-9.8"
+            """Render the canonical slice string."""
+            return f"{self.KIND}:{self.start}-{self.end}"
+    
+        def __str__(self) -> str:  # Same as `to_slice_string`
+        "Render the canonical slice string."
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict with "kind" discriminator
+            """Serialize to the wire dict form."""
+            return {"kind": self.KIND, "start": self.start, "end": self.end}
+        "Serialize to the wire dict form."
+```
+
+``` python
+class FrameSlice:
+    "Frame-range slice into a video facet."
+    
+    def to_slice_string(self) -> str:  # e.g. "frame:0-120"
+            """Render the canonical slice string."""
+            return f"{self.KIND}:{self.start}-{self.end}"
+    
+        def __str__(self) -> str:  # Same as `to_slice_string`
+        "Render the canonical slice string."
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict with "kind" discriminator
+            """Serialize to the wire dict form."""
+            return {"kind": self.KIND, "start": self.start, "end": self.end}
+        "Serialize to the wire dict form."
+```
+
+``` python
+class LineSlice:
+    "Line-range slice into code or structured text."
+    
+    def to_slice_string(self) -> str:  # e.g. "line:10-25"
+            """Render the canonical slice string."""
+            return f"{self.KIND}:{self.start}-{self.end}"
+    
+        def __str__(self) -> str:  # Same as `to_slice_string`
+        "Render the canonical slice string."
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict with "kind" discriminator
+            """Serialize to the wire dict form."""
+            return {"kind": self.KIND, "start": self.start, "end": self.end}
+        "Serialize to the wire dict form."
+```
+
+``` python
+class PageSlice:
+    "Page slice into a paginated document facet (PDF, EPUB)."
+    
+    def to_slice_string(self) -> str:  # e.g. "page:3" or "page:3:bbox:10,20,300,400"
+            """Render the canonical slice string."""
+            if self.bbox
+        "Render the canonical slice string."
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict with "kind" discriminator
+            """Serialize to the wire dict form."""
+            return {"kind": self.KIND, "page": self.page, "bbox": self.bbox}
+        "Serialize to the wire dict form."
+```
+
+``` python
+class FullContent:
+    """
+    Whole-facet reference (no range) — selects a content facet without slicing.
+    
+    `SourceRef.slice=None` means "the whole resource"; `FullContent` is the
+    facet-selecting variant ("the whole AUDIO of this node") for multi-facet
+    targets.
+    """
+    
+    def to_slice_string(self) -> str:  # e.g. "full:audio"
+            """Render the canonical slice string."""
+            return f"{self.KIND}:{self.content_type}"
+    
+        def __str__(self) -> str:  # Same as `to_slice_string`
+        "Render the canonical slice string."
+    
+    def to_dict(self) -> Dict[str, Any]:  # Wire dict with "kind" discriminator
+            """Serialize to the wire dict form."""
+            return {"kind": self.KIND, "content_type": self.content_type}
+        "Serialize to the wire dict form."
+```
+
+``` python
+class UnknownSlice:
+    """
+    Lossless carrier for a slice kind this library version does not know.
+    
+    Same forward-compatibility law as `UnknownLocator`: round-trip, don't drop.
+    """
+    
+    def to_slice_string(self) -> str:  # Best-effort canonical string: "<kind>:<canonical-json>"
+            """Render a deterministic best-effort slice string."""
+            canonical = json.dumps(self.data, sort_keys=True, separators=(",", ":"))
+            return f"{self.kind}:{canonical}"
+    
+        def __str__(self) -> str:  # Same as `to_slice_string`
+        "Render a deterministic best-effort slice string."
+    
+    def to_dict(self) -> Dict[str, Any]:  # The original wire dict, reconstructed verbatim
+            """Serialize back to the original wire dict form."""
+            return {"kind": self.kind, **self.data}
+        "Serialize back to the original wire dict form."
+```
+
+#### Variables
+
+``` python
+TypedSlice  # The slice sum type
+SLICE_KINDS: Dict[str, type]
+```
