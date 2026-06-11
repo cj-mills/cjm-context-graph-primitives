@@ -1,4 +1,4 @@
-"""The graph data nouns — `GraphNode` / `GraphEdge` / `GraphContext`. Moved here from `cjm-graph-plugin-system` per the data-nouns-vs-storage-verbs split (pass-2 Thread 2): every consumer of graph DATA (workflow cores, bundles, the CR-18 graph-aware layer, the storage adapter itself) depends on this library; only persistence depends on the storage adapter. `GraphContext` satisfies the substrate's `FileBackedDTO` protocol (`to_temp_file`) for zero-copy worker transfer.
+"""The graph data nouns — `GraphNode` / `GraphEdge` / `GraphContext`. Moved here from `cjm-graph-plugin-system` per the data-nouns-vs-storage-verbs split (pass-2 Thread 2): every consumer of graph DATA (workflow cores, bundles, the CR-18 graph-aware layer, the storage adapter itself) depends on this library; only persistence depends on the storage adapter. `GraphContext` satisfies the substrate's `FileBackedDTO` protocol (`to_temp_file`) for zero-copy worker transfer. All three nouns are **wire-registered** (stage 4): graph-storage adapter methods return them typed across the worker boundary, retiring the last honest-dict graph results (ledger C20/F8).
 
 Docs: https://cj-mills.github.io/cjm-context-graph-primitivesgraph.html.md"""
 
@@ -14,9 +14,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from cjm_plugin_system.core.wire import wire_type
+
 from .provenance import SourceRef
 
 # %% ../nbs/graph.ipynb #2b42380b
+@wire_type("graph.node")
 @dataclass
 class GraphNode:
     """An entity in a context graph.
@@ -63,6 +66,7 @@ class GraphNode:
         )
 
 # %% ../nbs/graph.ipynb #62668064
+@wire_type("graph.edge")
 @dataclass
 class GraphEdge:
     """A relationship between two nodes. Composition is ALWAYS edges — grouping,
@@ -105,6 +109,7 @@ class GraphEdge:
         )
 
 # %% ../nbs/graph.ipynb #f167174b
+@wire_type("graph.context")
 @dataclass
 class GraphContext:
     """Container for graph read results (a subgraph).
