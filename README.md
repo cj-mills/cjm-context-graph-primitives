@@ -45,7 +45,7 @@ spine.to_dict()["type"]
 ## Project Structure
 
     nbs/
-    ├── graph.ipynb      # The graph data nouns — `GraphNode` / `GraphEdge` / `GraphContext`. Moved here from `cjm-graph-plugin-system` per the data-nouns-vs-storage-verbs split (pass-2 Thread 2): every consumer of graph DATA (workflow cores, bundles, the CR-18 graph-aware layer, the storage adapter itself) depends on this library; only persistence depends on the storage adapter. `GraphContext` satisfies the substrate's `FileBackedDTO` protocol (`to_temp_file`) for zero-copy worker transfer.
+    ├── graph.ipynb      # The graph data nouns — `GraphNode` / `GraphEdge` / `GraphContext`. Moved here from `cjm-graph-plugin-system` per the data-nouns-vs-storage-verbs split (pass-2 Thread 2): every consumer of graph DATA (workflow cores, bundles, the CR-18 graph-aware layer, the storage adapter itself) depends on this library; only persistence depends on the storage adapter. `GraphContext` satisfies the substrate's `FileBackedDTO` protocol (`to_temp_file`) for zero-copy worker transfer. All three nouns are **wire-registered** (stage 4): graph-storage adapter methods return them typed across the worker boundary, retiring the last honest-dict graph results (ledger C20/F8).
     ├── locators.ipynb   # Structured resource locators — the typed sum type addressing WHERE referenced content lives (CR-19). A locator renders a canonical URI string for the things strings are good at (grep, logs, cache keys, display) while keeping typed field access primary; unknown kinds round-trip losslessly for forward compatibility.
     ├── provenance.ipynb # `SourceRef` — the cross-cutting provenance reference (CR-19). **Identity = `content_hash` (PRIMARY); location = `locator`; region = optional atomic typed `slice`.** `verify()` is hash-based regardless of whether the locator still resolves — the structural fix for dangling row-id provenance (cache-hit rows; ledgers E13/D3).
     ├── query.ipynb      # The structured typed query expression (pass-2 Thread 5) — DATA nouns describing graph reads. **Execution lives in graph-storage adapters** (stage 4 translates expressions per-backend); this library only defines, validates, and (de)serializes them. Typed expressions are the primary, portable surface — no storage-schema leak (the raw-SQL `nodes`/`edges` + `json_extract` coupling of ledger C2/C3), and scale-shaped (server-side filter/page/count answering D13). `RawQuery` is the explicitly-marked, backend-coupled escape hatch: recurring raw patterns EXPOSE missing typed-expression capabilities and get PROMOTED into the typed surface (the real-world-testing forcing function).
@@ -63,15 +63,16 @@ graph LR
     query["query<br/>query"]
     slices["slices<br/>slices"]
 
-    graph_mod --> provenance
-    graph_mod --> locators
     graph_mod --> slices
+    graph_mod --> locators
+    graph_mod --> provenance
     provenance --> locators
     provenance --> slices
     query --> locators
+    query --> graph_mod
 ```
 
-*6 cross-module dependencies detected*
+*7 cross-module dependencies detected*
 
 ## CLI Reference
 
@@ -90,7 +91,9 @@ Detailed documentation for each module in the project:
 > storage adapter itself) depends on this library; only persistence
 > depends on the storage adapter. `GraphContext` satisfies the
 > substrate’s `FileBackedDTO` protocol (`to_temp_file`) for zero-copy
-> worker transfer.
+> worker transfer. All three nouns are **wire-registered** (stage 4):
+> graph-storage adapter methods return them typed across the worker
+> boundary, retiring the last honest-dict graph results (ledger C20/F8).
 
 #### Import
 
@@ -411,6 +414,7 @@ from cjm_context_graph_primitives.query import (
     PREDICATE_OPS,
     RELATION_DIRECTIONS,
     QUERY_TYPES,
+    RESULT_TYPES,
     PropertyPredicate,
     SourcePredicate,
     RelationPredicate,
@@ -418,7 +422,11 @@ from cjm_context_graph_primitives.query import (
     NodeQuery,
     EdgeQuery,
     RawQuery,
-    query_from_dict
+    query_from_dict,
+    NodeQueryResult,
+    EdgeQueryResult,
+    RawQueryResult,
+    result_from_dict
 )
 ```
 
@@ -431,11 +439,23 @@ def query_from_dict(
     "Reconstruct a query expression from its tagged wire dict."
 ```
 
+``` python
+def result_from_dict(
+    d: Dict[str, Any]  # Tagged wire dict ("type" in RESULT_TYPES)
+) -> Any:  # NodeQueryResult | EdgeQueryResult | RawQueryResult
+    "Reconstruct a query result from its tagged wire dict."
+```
+
 #### Classes
 
 ``` python
 class PropertyPredicate:
-    "One property comparison; a query's `where` list combines predicates with AND."
+    """
+    One property comparison; a query's `where` list combines predicates with AND.
+    
+    `prop` may be a dotted path descending nested property JSON
+    (e.g. `payload.document_id` — stage-4 promotion, sites C-8/C-9).
+    """
     
     def to_dict(self) -> Dict[str, Any]:  # Wire dict
             """Serialize to the wire dict form."""
@@ -476,6 +496,12 @@ class RelationPredicate:
     Match nodes that have an edge of `relation_type` (one-hop, typed traversal —
     e.g. "Segments PART_OF document D"). Depth-N neighborhood reads stay on
     `get_context`; richer traversal expressions wait for adopter evidence.
+    
+    Far-end constraints (stage-4 promotions, exactly one hop deep):
+    `node_id`/`node_ids` pin the far-end node (batch form = C17); `node_source`
+    matches the far end by provenance (the two-hop
+    `find_prior_corrections_by_hash` read: "Corrections whose CORRECTS target
+    carries this content hash").
     """
     
     def to_dict(self) -> Dict[str, Any]:  # Wire dict
@@ -514,7 +540,9 @@ class NodeQuery:
     
     All filter fields combine with AND. `count=True` returns a count instead of
     rows (the D13 verify-spine aggregate shape). `project` limits returned
-    properties (server-side projection; None = whole nodes).
+    properties (server-side projection; None = whole nodes). Projected rows
+    ALWAYS carry the structural field `id`; the pseudo-field `"sources"` is
+    projectable (the C-2 spine read needs id + properties + sources).
     """
     
     ids: Optional[List[str]]  # Batch-by-id (C17); None = no id filter
@@ -526,7 +554,7 @@ class NodeQuery:
     limit: Optional[int]  # Page size; None = backend default
     offset: int = 0  # Page offset
     count: bool = False  # Return count instead of rows
-    project: Optional[List[str]]  # Property names to return; None = whole nodes
+    project: Optional[List[str]]  # Property names (dotted paths ok) + "sources"; None = whole nodes
     
     def to_dict(self) -> Dict[str, Any]:  # Tagged wire dict
             """Serialize to the wire dict form."""
@@ -549,19 +577,32 @@ class EdgeQuery:
     
     Covers the cores' edge reads: counting edges by relation type for a spine
     (D13 verify aggregates) and reading edge properties off a node's edges
-    (correction decisions).
+    (correction decisions). Projected rows ALWAYS carry the structural fields
+    `id`, `source_id`, `target_id` (the review-markers read needs target_id +
+    one property).
+    
+    Endpoint constraints (stage-4 promotions): `source_ids`/`target_ids` pin an
+    endpoint to an id set (superseded-set read); `source_related`/
+    `target_related` constrain an endpoint by ITS relations — the D13
+    NEXT-chain count ("NEXT edges whose source node is PART_OF doc D") without
+    materializing the document's segment ids. Exactly one hop deep, mirroring
+    `RelationPredicate`'s far-end constraints.
     """
     
     ids: Optional[List[str]]  # Batch-by-id; None = no id filter
     relation_type: Optional[str]  # Edge relation-type filter
-    source_id: Optional[str]  # Origin node filter
-    target_id: Optional[str]  # Destination node filter
+    source_id: Optional[str]  # Origin node filter (single)
+    target_id: Optional[str]  # Destination node filter (single)
+    source_ids: Optional[List[str]]  # Origin node filter (batch)
+    target_ids: Optional[List[str]]  # Destination node filter (batch)
+    source_related: Optional[RelationPredicate]  # Constrain the origin node by its relations
+    target_related: Optional[RelationPredicate]  # Constrain the destination node by its relations
     where: List[PropertyPredicate] = field(...)  # Property predicates (AND)
     order_by: Optional[OrderBy]  # Server-side ordering
     limit: Optional[int]  # Page size; None = backend default
     offset: int = 0  # Page offset
     count: bool = False  # Return count instead of rows
-    project: Optional[List[str]]  # Property names to return; None = whole edges
+    project: Optional[List[str]]  # Property names (dotted paths ok); None = whole edges
     
     def to_dict(self) -> Dict[str, Any]:  # Tagged wire dict
             """Serialize to the wire dict form."""
@@ -604,12 +645,90 @@ class RawQuery:
         "Reconstruct from the wire dict form."
 ```
 
+``` python
+@dataclass
+class NodeQueryResult:
+    """
+    Typed result of a `NodeQuery` — exactly one field is populated,
+    mirroring the query's mode (default → `nodes`, project → `rows`,
+    count → `count`).
+    """
+    
+    nodes: Optional[List[GraphNode]]  # Full nodes (default mode)
+    rows: Optional[List[Dict[str, Any]]]  # Projected rows (project mode); always carry "id"
+    count: Optional[int]  # Count (count mode)
+    
+    def to_dict(self) -> Dict[str, Any]:  # Tagged wire dict
+            """Serialize to the wire dict form."""
+            return {
+                "type": self.TYPE,
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            d: Dict[str, Any]  # Tagged wire dict
+        ) -> "NodeQueryResult":  # Reconstructed result
+        "Reconstruct from the wire dict form (nested nodes via `GraphNode.from_dict`)."
+```
+
+``` python
+@dataclass
+class EdgeQueryResult:
+    """
+    Typed result of an `EdgeQuery` — exactly one field is populated,
+    mirroring the query's mode (default → `edges`, project → `rows`,
+    count → `count`).
+    """
+    
+    edges: Optional[List[GraphEdge]]  # Full edges (default mode)
+    rows: Optional[List[Dict[str, Any]]]  # Projected rows; always carry "id", "source_id", "target_id"
+    count: Optional[int]  # Count (count mode)
+    
+    def to_dict(self) -> Dict[str, Any]:  # Tagged wire dict
+            """Serialize to the wire dict form."""
+            return {
+                "type": self.TYPE,
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            d: Dict[str, Any]  # Tagged wire dict
+        ) -> "EdgeQueryResult":  # Reconstructed result
+        "Reconstruct from the wire dict form (nested edges via `GraphEdge.from_dict`)."
+```
+
+``` python
+@dataclass
+class RawQueryResult:
+    """
+    Typed result of a `RawQuery` — tabular, backend-shaped (the columns are
+    whatever the raw text selected; non-portable like the query itself).
+    """
+    
+    columns: List[str] = field(...)  # Column names from the raw read
+    rows: List[List[Any]] = field(...)  # Result rows (positional, matching columns)
+    row_count: int = 0  # len(rows) convenience
+    backend: str = ''  # Backend that executed it (echo of RawQuery.backend)
+    
+    def to_dict(self) -> Dict[str, Any]:  # Tagged wire dict
+            """Serialize to the wire dict form."""
+            return {"type": self.TYPE, "columns": self.columns, "rows": self.rows,
+        "Serialize to the wire dict form."
+    
+    def from_dict(
+            cls,
+            d: Dict[str, Any]  # Tagged wire dict
+        ) -> "RawQueryResult":  # Reconstructed result
+        "Reconstruct from the wire dict form."
+```
+
 #### Variables
 
 ``` python
 PREDICATE_OPS  # Reserved operator vocabulary (executors may implement a subset but MUST raise on unsupported ops)
 RELATION_DIRECTIONS  # Edge direction relative to the candidate node
 QUERY_TYPES: Dict[str, type]
+RESULT_TYPES: Dict[str, type]
 ```
 
 ### slices (`slices.ipynb`)
