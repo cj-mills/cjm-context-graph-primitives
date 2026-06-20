@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, Optional, Union
 
-from cjm_plugin_system.core.errors import PluginInputError
+from cjm_substrate.core.errors import CapabilityInputError
 
 # %% ../nbs/locators.ipynb #7ce6b17e
 @dataclass(frozen=True)
@@ -115,7 +115,7 @@ def locator_from_dict(
     """
     kind = d.get("kind")
     if not kind:
-        raise PluginInputError(
+        raise CapabilityInputError(
             f"Locator dict missing 'kind' discriminator: {d!r}",
             fields_invalid=["kind"],
         )
@@ -126,7 +126,7 @@ def locator_from_dict(
     try:
         return cls(**payload)
     except TypeError as e:
-        raise PluginInputError(
+        raise CapabilityInputError(
             f"Malformed '{kind}' locator payload {payload!r}: {e}",
             fields_invalid=list(payload.keys()),
         ) from e

@@ -13,8 +13,8 @@ __all__ = ['PREDICATE_OPS', 'RELATION_DIRECTIONS', 'QUERY_TYPES', 'RESULT_TYPES'
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from cjm_plugin_system.core.errors import PluginInputError
-from cjm_plugin_system.core.wire import wire_type
+from cjm_substrate.core.errors import CapabilityInputError
+from cjm_substrate.core.wire import wire_type
 
 from .locators import ResourceLocator, locator_from_dict
 from .graph import GraphNode, GraphEdge
@@ -46,12 +46,12 @@ class PropertyPredicate:
 
     def __post_init__(self):
         if self.op not in PREDICATE_OPS:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 f"Unknown predicate op {self.op!r} (known: {PREDICATE_OPS})",
                 fields_invalid=["op"],
             )
         if self.op in ("is_null", "not_null") and self.value is not None:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 f"Op {self.op!r} takes no value (got {self.value!r})",
                 fields_invalid=["value"],
             )
@@ -79,7 +79,7 @@ class SourcePredicate:
 
     def __post_init__(self):
         if self.content_hash is None and self.locator is None:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 "SourcePredicate requires content_hash and/or locator",
                 fields_invalid=["content_hash", "locator"],
             )
@@ -126,12 +126,12 @@ class RelationPredicate:
 
     def __post_init__(self):
         if self.direction not in RELATION_DIRECTIONS:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 f"Unknown direction {self.direction!r} (known: {RELATION_DIRECTIONS})",
                 fields_invalid=["direction"],
             )
         if self.node_id is not None and self.node_ids is not None:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 "Use node_id OR node_ids, not both",
                 fields_invalid=["node_id", "node_ids"],
             )
@@ -269,12 +269,12 @@ class EdgeQuery:
 
     def __post_init__(self):
         if self.source_id is not None and self.source_ids is not None:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 "Use source_id OR source_ids, not both",
                 fields_invalid=["source_id", "source_ids"],
             )
         if self.target_id is not None and self.target_ids is not None:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 "Use target_id OR target_ids, not both",
                 fields_invalid=["target_id", "target_ids"],
             )
@@ -341,7 +341,7 @@ class RawQuery:
 
     def __post_init__(self):
         if not self.backend:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 "RawQuery requires an explicit backend (it is non-portable by construction)",
                 fields_invalid=["backend"],
             )
@@ -374,7 +374,7 @@ def query_from_dict(
     t = d.get("type")
     cls = QUERY_TYPES.get(t)
     if cls is None:
-        raise PluginInputError(
+        raise CapabilityInputError(
             f"Unknown query type {t!r} (known: {sorted(QUERY_TYPES)})",
             fields_invalid=["type"],
         )
@@ -492,7 +492,7 @@ def result_from_dict(
     t = d.get("type")
     cls = RESULT_TYPES.get(t)
     if cls is None:
-        raise PluginInputError(
+        raise CapabilityInputError(
             f"Unknown result type {t!r} (known: {sorted(RESULT_TYPES)})",
             fields_invalid=["type"],
         )

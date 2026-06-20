@@ -11,8 +11,8 @@ __all__ = ['SourceRef']
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from cjm_plugin_system.core.errors import PluginInputError
-from cjm_plugin_system.utils.hashing import hash_bytes, verify_hash
+from cjm_substrate.core.errors import CapabilityInputError
+from cjm_substrate.utils.hashing import hash_bytes, verify_hash
 
 from .locators import ResourceLocator, locator_from_dict
 from .slices import TypedSlice, slice_from_dict
@@ -55,7 +55,7 @@ class SourceRef:
     ) -> "SourceRef":  # Reconstructed reference (unknown locator/slice kinds round-trip)
         """Reconstruct from the wire dict form."""
         if "locator" not in d or "content_hash" not in d:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 f"SourceRef dict missing required keys: {sorted(d.keys())!r}",
                 fields_invalid=[k for k in ("locator", "content_hash") if k not in d],
             )

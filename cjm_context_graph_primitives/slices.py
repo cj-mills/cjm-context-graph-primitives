@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, Optional, Union
 
-from cjm_plugin_system.core.errors import PluginInputError
+from cjm_substrate.core.errors import CapabilityInputError
 
 # %% ../nbs/slices.ipynb #488aa68c
 @dataclass(frozen=True)
@@ -26,7 +26,7 @@ class CharSlice:
 
     def __post_init__(self):
         if self.start < 0 or self.end < self.start:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 f"Invalid char range {self.start}-{self.end}",
                 fields_invalid=["start", "end"],
             )
@@ -59,7 +59,7 @@ class TimeSlice:
 
     def __post_init__(self):
         if self.start < 0 or self.end < self.start:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 f"Invalid time range {self.start}-{self.end}",
                 fields_invalid=["start", "end"],
             )
@@ -86,7 +86,7 @@ class FrameSlice:
 
     def __post_init__(self):
         if self.start < 0 or self.end < self.start:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 f"Invalid frame range {self.start}-{self.end}",
                 fields_invalid=["start", "end"],
             )
@@ -113,7 +113,7 @@ class LineSlice:
 
     def __post_init__(self):
         if self.start < 0 or self.end < self.start:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 f"Invalid line range {self.start}-{self.end}",
                 fields_invalid=["start", "end"],
             )
@@ -140,7 +140,7 @@ class PageSlice:
 
     def __post_init__(self):
         if self.page < 1:
-            raise PluginInputError(
+            raise CapabilityInputError(
                 f"Invalid page number {self.page}",
                 fields_invalid=["page"],
             )
@@ -227,7 +227,7 @@ def slice_from_dict(
     """
     kind = d.get("kind")
     if not kind:
-        raise PluginInputError(
+        raise CapabilityInputError(
             f"Slice dict missing 'kind' discriminator: {d!r}",
             fields_invalid=["kind"],
         )
@@ -238,7 +238,7 @@ def slice_from_dict(
     try:
         return cls(**payload)
     except TypeError as e:
-        raise PluginInputError(
+        raise CapabilityInputError(
             f"Malformed '{kind}' slice payload {payload!r}: {e}",
             fields_invalid=list(payload.keys()),
         ) from e
@@ -272,7 +272,7 @@ def parse_slice(
         return PageSlice(page=int(rest))
     if s.startswith("full:"):
         return FullContent(content_type=s[5:])
-    raise PluginInputError(
+    raise CapabilityInputError(
         f"Unknown slice format: {s!r}",
         fields_invalid=["s"],
     )
