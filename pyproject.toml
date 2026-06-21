@@ -16,7 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
 ]
 dependencies = [
-    "cjm-substrate>=0.0.50",
+    "cjm-substrate>=0.0.51",
 ]
 
 [project.urls]
