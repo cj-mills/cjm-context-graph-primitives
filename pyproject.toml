@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "Apache-2.0"}
 authors = [{name = "Christian J. Mills", email = "9126128+cj-mills@users.noreply.github.com"}]
-keywords = ['nbdev']
+keywords = ['python']
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -21,10 +21,6 @@ dependencies = [
 
 [project.urls]
 Repository = "https://github.com/cj-mills/cjm-context-graph-primitives"
-Documentation = "https://cj-mills.github.io/cjm-context-graph-primitives/"
-
-[project.entry-points.nbdev]
-cjm_context_graph_primitives = "cjm_context_graph_primitives._modidx:d"
 
 [tool.setuptools.dynamic]
 version = {attr = "cjm_context_graph_primitives.__version__"}
@@ -32,4 +28,3 @@ version = {attr = "cjm_context_graph_primitives.__version__"}
 [tool.setuptools.packages.find]
 include = ["cjm_context_graph_primitives*"]
 
-[tool.nbdev]
