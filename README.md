@@ -23,6 +23,7 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 
 ### `cjm_context_graph_primitives.journal`
 
+- `append_op` _function_ — Append one op record — the envelope-agnostic core `append_write` wraps.
 - `append_write` _function_ — Append one write op (skipping an exact (verb,args) duplicate).
 - `current_session` _function_ — The session key stamped on journal appends (provenance, not replay input).
 - `read_journal` _function_ — Read every journaled write op (one JSON object per line; missing file = []).

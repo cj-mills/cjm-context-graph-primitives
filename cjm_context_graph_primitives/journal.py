@@ -38,18 +38,7 @@ def append_write(
 
     Args are the RESOLVED inputs to the core verb (e.g. an alias's discovered
     evidence ids), so replay is deterministic and independent of corpus state."""
-    for existing in read_journal(path):
-        if existing.get("verb") == verb and existing.get("args") == args:
-            return False  # already recorded — keep the log tidy (replay is idempotent anyway)
-    record = {"verb": verb, "ts": time.time(), "args": args}
-    session = current_session()
-    if session:
-        record["session"] = session
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a") as f:
-        f.write(json.dumps(record, sort_keys=True) + "\n")
-    return True
+    return append_op(path, {"verb": verb, "args": args})
 
 
 def current_session() -> Optional[str]:  # The active session key, or None
@@ -61,3 +50,38 @@ def current_session() -> Optional[str]:  # The active session key, or None
     per-verb `--session` coverage was 9% for exactly this reason). Stamped
     TOP-LEVEL on the record so dedup (verb+args) and replay stay session-blind."""
     return os.environ.get("CJM_SESSION") or None
+
+
+def append_op(
+    path: str,           # Journal file path (JSONL)
+    op: Dict[str, Any],  # The full op record — requires `verb`; envelope fields ride verbatim
+    dedup: bool = True,  # Skip an already-journaled duplicate (by `id` when present, else exact (verb, args))
+) -> bool:  # True if appended, False if skipped as a duplicate
+    """Append one op record — the envelope-agnostic core `append_write` wraps.
+
+    Stamps `ts` (and `session` from CJM_SESSION) only when ABSENT, so a domain
+    envelope's own fields (actor / set / anchor / minted ids / explicit ts) ride
+    through verbatim. Dedup prefers an explicit op `id` (exact-once semantics for
+    envelope ops) and falls back to the exact (verb, args) match. `dedup=False`
+    is the bulk path (genesis imports): a full journal rescan per append is
+    O(n^2) at import scale — bulk writers dedup upstream or not at all."""
+    if not op.get("verb"):
+        raise ValueError("append_op: op requires a `verb`")
+    if dedup:
+        oid = op.get("id")
+        for existing in read_journal(path):
+            if oid is not None and existing.get("id") == oid:
+                return False
+            if (oid is None and "id" not in existing
+                    and existing.get("verb") == op["verb"] and existing.get("args") == op.get("args")):
+                return False  # the exact-match lane is id-less records only — envelope ops never shadow it
+    record = dict(op)
+    record.setdefault("ts", time.time())
+    session = current_session()
+    if session and "session" not in record:
+        record["session"] = session
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+    return True
