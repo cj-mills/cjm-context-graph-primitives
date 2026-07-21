@@ -1,6 +1,7 @@
 """The journal core: envelope-agnostic append (append_op) + the append_write wrapper."""
 
-from cjm_context_graph_primitives.journal import append_op, append_write, read_journal
+from cjm_context_graph_primitives.journal import (append_op, append_write, journal_segments,
+                                                  maybe_rotate, read_journal, rotate_journal)
 
 
 def test_append_op_envelope_rides_verbatim(tmp_path):
@@ -33,3 +34,29 @@ def test_append_write_rides_append_op(tmp_path):
     assert not append_write(j, "decide", {"statement": "x"})
     recs = read_journal(j)
     assert len(recs) == 1 and recs[0]["verb"] == "decide" and "ts" in recs[0]
+
+
+def test_rotation_family_reads_as_one_journal(tmp_path):
+    """Rotation is a FILE-level repartition: family read == unrotated append order."""
+    j = str(tmp_path / "w.writes.jsonl")
+    append_op(j, {"verb": "v", "id": "op-1", "args": {"n": 1}})
+    cold1 = rotate_journal(j)
+    assert cold1.endswith("w.writes.0001.jsonl")
+    append_op(j, {"verb": "v", "id": "op-2", "args": {"n": 2}})
+    cold2 = rotate_journal(j)
+    assert cold2.endswith("w.writes.0002.jsonl")
+    append_op(j, {"verb": "v", "id": "op-3", "args": {"n": 3}})
+    assert journal_segments(j) == [cold1, cold2, j]
+    assert [op["id"] for op in read_journal(j)] == ["op-1", "op-2", "op-3"]
+    assert rotate_journal(str(tmp_path / "missing.jsonl")) is None  # empty/missing tail -> no-op
+
+
+def test_maybe_rotate_budget_and_cross_segment_dedup(tmp_path):
+    """The post-append check closes an over-budget tail; dedup sees cold segments."""
+    j = str(tmp_path / "w.writes.jsonl")
+    append_op(j, {"verb": "v", "id": "op-1", "args": {"blob": "x" * 64}})
+    assert maybe_rotate(j, max_bytes=32) is not None   # tail over budget -> segment closed
+    assert maybe_rotate(j, max_bytes=32) is None       # no tail -> nothing to close
+    append_op(j, {"verb": "v", "id": "op-2", "args": {}})
+    assert not append_op(j, {"verb": "v", "id": "op-1", "args": {}})  # id dedup spans segments
+    assert len(journal_segments(j)) == 2 and len(read_journal(j)) == 2
