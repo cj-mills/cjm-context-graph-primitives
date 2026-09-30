@@ -209,7 +209,8 @@ class NodeQuery:
 
     All filter fields combine with AND. `count=True` returns a count instead of
     rows (the D13 verify-spine aggregate shape). `project` limits returned
-    properties (server-side projection; None = whole nodes). Projected rows
+    properties (server-side projection; None = whole nodes); a projected
+    property keeps its JSON type (a list stays a list). Projected rows
     ALWAYS carry the structural field `id`; the pseudo-field `"sources"` is
     projectable (the C-2 spine read needs id + properties + sources).
     """
@@ -271,7 +272,7 @@ class EdgeQuery:
     (D13 verify aggregates) and reading edge properties off a node's edges
     (correction decisions). Projected rows ALWAYS carry the structural fields
     `id`, `source_id`, `target_id` (the review-markers read needs target_id +
-    one property).
+    one property); a projected property keeps its JSON type, as on `NodeQuery`.
 
     Endpoint constraints (stage-4 promotions): `source_ids`/`target_ids` pin an
     endpoint to an id set (superseded-set read); `source_related`/
