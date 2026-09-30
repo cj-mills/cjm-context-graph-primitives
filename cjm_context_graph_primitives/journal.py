@@ -4,14 +4,66 @@ The shared PRIMITIVE under every workflow journal (DEC ccbab9f5 point 1): a grap
 rebuildable PROJECTION; the non-re-derivable knowledge lives as an append-only log of write
 ops. Domain layers own their op vocabularies and REPLAY (each registers its own verbs);
 this module owns the discipline — append-on-success with exact-duplicate skip, read in
-append order, session stamping for provenance.
+append order, session stamping for provenance, and the OP CLOCK every write reads its time from.
 """
 
+import functools
+import inspect
 import json
 import os
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
+
+# THE OP CLOCK (design 8f6f2343, finding fbce0173; the replay window of 0d50b921 moved down
+# here). One op has ONE time: its journaled `ts`. Replay opens this window at each op's ts; a
+# live write opens it with ONE clock read (`op_clock`) around its db write and its appends, so
+# everything the op stamps — created_at / updated_at on what it adds, asserted_at, its own
+# `ts` — is the same value live and on rebuild. Async-scoped (ContextVar); the layer re-exports
+# this object, so replay and live share one variable.
+PROVENANCE_TS: ContextVar[Optional[float]] = ContextVar("provenance_ts", default=None)
+
+
+def op_now() -> float:  # The open window's ts, else a fresh clock read
+    """The op clock's current value: every write-path time reads THIS, never `time.time()`."""
+    ts = PROVENANCE_TS.get()
+    return ts if ts is not None else time.time()
+
+
+@contextmanager
+def op_clock() -> Iterator[float]:  # The window's ts for the duration of the block
+    """Open one op's clock window: reuse an open one (replay, or an enclosing write unit),
+    else read the clock ONCE and hold it until the block exits."""
+    ts = PROVENANCE_TS.get()
+    if ts is not None:
+        yield ts
+        return
+    ts = time.time()
+    token = PROVENANCE_TS.set(ts)
+    try:
+        yield ts
+    finally:
+        PROVENANCE_TS.reset(token)
+
+
+def op_clocked(fn):  # The function, run inside one op clock window per call
+    """Decorator form of `op_clock` for a write entry point (sync or async): every db write
+    it makes and every op it journals carry one time. The grain is one call — a CLI
+    invocation, an app's write gesture, a core's commit (amendment efd659a1)."""
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def run_async(*args, **kwargs):
+            with op_clock():
+                return await fn(*args, **kwargs)
+        return run_async
+
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        with op_clock():
+            return fn(*args, **kwargs)
+    return run
 
 
 def read_journal(
@@ -58,7 +110,8 @@ def append_op(
 ) -> bool:  # True if appended, False if skipped as a duplicate
     """Append one op record — the envelope-agnostic core `append_write` wraps.
 
-    Stamps `ts` (and `session` from CJM_SESSION) only when ABSENT, so a domain
+    Stamps `ts` from the op clock (an open window's ts, so the op carries the time its db
+    write already used) and `session` from CJM_SESSION, only when ABSENT, so a domain
     envelope's own fields (actor / set / anchor / minted ids / explicit ts) ride
     through verbatim. Dedup prefers an explicit op `id` (exact-once semantics for
     envelope ops) and falls back to the exact (verb, args) match. `dedup=False`
@@ -75,7 +128,7 @@ def append_op(
                     and existing.get("verb") == op["verb"] and existing.get("args") == op.get("args")):
                 return False  # the exact-match lane is id-less records only — envelope ops never shadow it
     record = dict(op)
-    record.setdefault("ts", time.time())
+    record.setdefault("ts", op_now())
     session = current_session()
     if session and "session" not in record:
         record["session"] = session
