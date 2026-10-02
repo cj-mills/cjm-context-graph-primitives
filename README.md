@@ -6,6 +6,7 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 
 ## Modules
 
+- **`cjm_context_graph_primitives.__init__`**
 - **`cjm_context_graph_primitives.graph`** — The graph data nouns - GraphNode / GraphEdge / GraphContext. Moved here from cjm-graph-plugin-system per the data-nouns-vs-storage-verbs split (pass-2 Thread 2): every consumer of graph DATA (workflow cores, bundles, the CR-18 graph-aware layer, the storage adapter itself) depends on this library; only persistence depends on the storage adapter. GraphContext satisfies the substrate's FileBackedDTO protocol (to_temp_file) for zero-copy worker transfer. All three nouns are wire-registered (stage 4): graph-storage adapter methods return them typed across the worker boundary.
 - **`cjm_context_graph_primitives.journal`** — The write-journal core: append-only JSONL ops — the durable, replayable source of truth.
 - **`cjm_context_graph_primitives.locators`** — Structured resource locators - the typed sum type addressing WHERE referenced content lives (CR-19). A locator renders a canonical URI string for the things strings are good at (grep, logs, cache keys, display) while keeping typed field access primary; unknown kinds round-trip losslessly for forward compatibility.
@@ -28,7 +29,10 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 - `current_session` _function_ — The session key stamped on journal appends (provenance, not replay input).
 - `journal_segments` _function_ — The journal's SEGMENT FAMILY: rotated cold segments + the live tail.
 - `maybe_rotate` _function_ — Rotate the live tail once it reaches the budget (the POST-append check).
-- `read_journal` _function_ — Read every journaled write op (one JSON object per line; missing file = []).
+- `op_clock` _function_ — Open one op's clock window: reuse an open one (replay, or an enclosing write unit),
+- `op_clocked` _function_ — Decorator form of `op_clock` for a write entry point (sync or async): every db write
+- `op_now` _function_ — The op clock's current value: every write-path time reads THIS, never `time.time()`.
+- `read_journal` _function_ — Read every journaled write op across the SEGMENT FAMILY (one JSON object per
 - `rotate_journal` _function_ — Close the live tail into the next immutable cold segment (explicit rotation).
 
 ### `cjm_context_graph_primitives.locators`
@@ -72,4 +76,4 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 ## Dependencies
 
 **Depends on:** `cjm-substrate`
-**Used by:** `cjm-capability-graph-sqlite`, `cjm-context-graph-layer`, `cjm-context-graph-projection`, `cjm-dev-graph-schema`, `cjm-markdown-decompose-core`, `cjm-notebook-decompose-core`, `cjm-python-decompose-core`, `cjm-transcript-correction-core`, `cjm-transcript-correction-tui`, `cjm-transcript-decomp-core`, `cjm-transcript-graph-schema`
+**Used by:** `cjm-capability-graph-sqlite`, `cjm-context-graph-layer`, `cjm-context-graph-projection`, `cjm-dev-graph-schema`, `cjm-graph-storage-adapter-interface`, `cjm-graph-workbench-qt`, `cjm-markdown-decompose-core`, `cjm-notebook-decompose-core`, `cjm-python-decompose-core`, `cjm-session-scratchpad-qt`, `cjm-substrate-qt-kit`, `cjm-transcript-correction-core`, `cjm-transcript-decomp-core`, `cjm-transcript-graph-schema`, `cjm-transcription-core`, `cjm-workflow-hub-qt`
