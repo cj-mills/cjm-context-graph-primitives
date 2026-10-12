@@ -70,6 +70,7 @@ class PropertyPredicate:
 
     `prop` may be a dotted path descending nested property JSON
     (e.g. `payload.document_id` — stage-4 promotion, sites C-8/C-9)."""
+
     prop: str          # Property name inside the entity's properties payload (dotted path descends nesting)
     op: str            # Operator from PREDICATE_OPS
     value: Any = None  # Comparison value (must be None for is_null/not_null)
@@ -104,6 +105,7 @@ class SourcePredicate:
     """Match nodes whose `sources` contain a reference matching by content hash
     and/or locator — the typed form of the reverse provenance index
     (`find_prior_corrections_by_hash`-style reads; identity-first per CR-19)."""
+
     content_hash: Optional[str] = None        # Match refs with this content hash (PRIMARY identity)
     locator: Optional[ResourceLocator] = None  # Match refs with this locator
 
@@ -148,6 +150,7 @@ class RelationPredicate:
     matches the far end by provenance (the two-hop
     `find_prior_corrections_by_hash` read: "Corrections whose CORRECTS target
     carries this content hash")."""
+
     relation_type: str             # Edge relation type, e.g. "PART_OF", "CORRECTS"
     direction: str = "out"         # Edge direction from the candidate node: out / in / both
     node_id: Optional[str] = None  # Constrain the far end to this node id (None = any)
@@ -187,6 +190,7 @@ class RelationPredicate:
 @dataclass(frozen=True)
 class OrderBy:
     """Result ordering by one property (server-side; C2/C3 ORDER BY index)."""
+
     prop: str                 # Property name to order by
     descending: bool = False  # Descending order when True
 
@@ -214,6 +218,7 @@ class NodeQuery:
     ALWAYS carry the structural field `id`; the pseudo-field `"sources"` is
     projectable (the C-2 spine read needs id + properties + sources).
     """
+
     ids: Optional[List[str]] = None              # Batch-by-id (C17); None = no id filter
     label: Optional[str] = None                  # Node label filter
     where: List[PropertyPredicate] = field(default_factory=list)  # Property predicates (AND)
@@ -281,6 +286,7 @@ class EdgeQuery:
     materializing the document's segment ids. Exactly one hop deep, mirroring
     `RelationPredicate`'s far-end constraints.
     """
+
     ids: Optional[List[str]] = None       # Batch-by-id; None = no id filter
     relation_type: Optional[str] = None   # Edge relation-type filter
     source_id: Optional[str] = None       # Origin node filter (single)
@@ -364,6 +370,7 @@ class RawQuery:
     backend mismatch. Recurring raw patterns are promotion candidates into the
     typed surface (record them; that is the forcing function).
     """
+
     text: str      # Backend-native query text (e.g. SQL)
     backend: str   # Backend this query is coupled to (e.g. "sqlite"); executors refuse mismatches
     params: Any = field(default_factory=list)  # Positional list or named dict of parameters
@@ -418,6 +425,7 @@ class NodeQueryResult:
     """Typed result of a `NodeQuery` — exactly one field is populated,
     mirroring the query's mode (default → `nodes`, project → `rows`,
     count → `count`)."""
+
     nodes: Optional[List[GraphNode]] = None      # Full nodes (default mode)
     rows: Optional[List[Dict[str, Any]]] = None  # Projected rows (project mode); always carry "id"
     count: Optional[int] = None                  # Count (count mode)
@@ -453,6 +461,7 @@ class EdgeQueryResult:
     """Typed result of an `EdgeQuery` — exactly one field is populated,
     mirroring the query's mode (default → `edges`, project → `rows`,
     count → `count`)."""
+
     edges: Optional[List[GraphEdge]] = None      # Full edges (default mode)
     rows: Optional[List[Dict[str, Any]]] = None  # Projected rows; always carry "id", "source_id", "target_id"
     count: Optional[int] = None                  # Count (count mode)
@@ -487,6 +496,7 @@ class EdgeQueryResult:
 class RawQueryResult:
     """Typed result of a `RawQuery` — tabular, backend-shaped (the columns are
     whatever the raw text selected; non-portable like the query itself)."""
+
     columns: List[str] = field(default_factory=list)      # Column names from the raw read
     rows: List[List[Any]] = field(default_factory=list)   # Result rows (positional, matching columns)
     row_count: int = 0                                    # len(rows) convenience

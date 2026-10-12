@@ -38,6 +38,7 @@ class GraphNodeRef:
     real with provenance bundles (CR-20); the field exists now so the wire shape
     does not change when they do.
     """
+
     node_id: str                    # Target node id (UUID)
     graph_id: Optional[str] = None  # Owning graph id; None = the current graph
 
@@ -65,6 +66,7 @@ class FileRef:
     canonical string, not an RFC 3986 URI (no percent-encoding; corpus paths
     contain spaces).
     """
+
     path: str  # Absolute filesystem path
 
     KIND: ClassVar[str] = "file"  # Locator kind discriminator
@@ -94,6 +96,7 @@ class UnknownLocator:
     Not hashable in practice (carries a dict); known-kind locators are the
     value-object path.
     """
+
     kind: str                                            # The unrecognized kind discriminator
     data: Dict[str, Any] = field(default_factory=dict)   # Original payload, verbatim (minus "kind")
 

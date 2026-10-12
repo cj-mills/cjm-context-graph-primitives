@@ -31,6 +31,7 @@ from cjm_substrate.core.errors import CapabilityInputError
 @dataclass(frozen=True)
 class CharSlice:
     """Character-range slice into a text facet."""
+
     start: int  # Start character index (0-indexed, inclusive)
     end: int    # End character index (exclusive)
 
@@ -64,6 +65,7 @@ class TimeSlice:
     boundaries and never produce a multi-chunk span (where-graph-begins,
     locked 2026-06-08).
     """
+
     start: float  # Start time in seconds
     end: float    # End time in seconds
 
@@ -91,6 +93,7 @@ class TimeSlice:
 @dataclass(frozen=True)
 class FrameSlice:
     """Frame-range slice into a video facet."""
+
     start: int  # Start frame number (inclusive)
     end: int    # End frame number (exclusive)
 
@@ -118,6 +121,7 @@ class FrameSlice:
 @dataclass(frozen=True)
 class LineSlice:
     """Line-range slice into code or structured text."""
+
     start: int  # Start line number (0-indexed, inclusive)
     end: int    # End line number (exclusive)
 
@@ -145,6 +149,7 @@ class LineSlice:
 @dataclass(frozen=True)
 class PageSlice:
     """Page slice into a paginated document facet (PDF, EPUB)."""
+
     page: int                  # Page number (1-indexed)
     bbox: Optional[str] = None  # Optional bounding box "x1,y1,x2,y2"
 
@@ -179,6 +184,7 @@ class FullContent:
     facet-selecting variant ("the whole AUDIO of this node") for multi-facet
     targets.
     """
+
     content_type: str = "text"  # Facet name: "text", "audio", "image", ...
 
     KIND: ClassVar[str] = "full"  # Slice kind discriminator
@@ -201,6 +207,7 @@ class UnknownSlice:
 
     Same forward-compatibility law as `UnknownLocator`: round-trip, don't drop.
     """
+
     kind: str                                           # The unrecognized kind discriminator
     data: Dict[str, Any] = field(default_factory=dict)  # Original payload, verbatim (minus "kind")
 

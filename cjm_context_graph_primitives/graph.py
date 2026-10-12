@@ -19,6 +19,7 @@ class GraphNode:
     e.g. a fine Segment carries an audio ref and a text ref — the slice kind
     selects the facet).
     """
+
     id: str            # UUID
     label: str         # e.g. "Source", "Segment", "Correction"
     properties: Dict[str, Any] = field(default_factory=dict)  # Arbitrary domain payload
@@ -63,6 +64,7 @@ class GraphEdge:
     """A relationship between two nodes. Composition is ALWAYS edges — grouping,
     chains, supersession, and provenance topology all live here, never in
     multi-range slices or per-ref chain fields."""
+
     id: str             # UUID
     source_id: str      # Origin node UUID
     target_id: str      # Destination node UUID
@@ -108,6 +110,7 @@ class GraphContext:
     Satisfies the substrate's `FileBackedDTO` protocol via `to_temp_file` for
     zero-copy transfer across the worker boundary.
     """
+
     nodes: List[GraphNode]  # Nodes in the subgraph
     edges: List[GraphEdge]  # Edges in the subgraph
     metadata: Dict[str, Any] = field(default_factory=dict)  # Query metadata, stats, etc.

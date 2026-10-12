@@ -32,6 +32,7 @@ class SourceRef:
     locator is a structured sum type (no `external:<path>` string abuse), the
     hash is primary identity, and the slice is typed and atomic.
     """
+
     locator: ResourceLocator           # WHERE the content lives/lived (may dangle without breaking verifiability)
     content_hash: str                  # PRIMARY identity: "algo:hexdigest" over the CONSUMED (sliced) content
     slice: Optional[TypedSlice] = None  # Consumed region, framed to the locator target; None = whole resource
