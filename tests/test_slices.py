@@ -1,11 +1,11 @@
 """Tests for cjm_context_graph_primitives.slices — atomic typed content slices.
 
 Projected from the slices notebook's test cell at the c25780e8 flip."""
-import pytest
 
-from cjm_context_graph_primitives.slices import (CharSlice, FrameSlice, FullContent,
-                                                 LineSlice, PageSlice, TimeSlice,
-                                                 UnknownSlice, parse_slice, slice_from_dict)
+import pytest
+from cjm_context_graph_primitives.slices import (CharSlice, FrameSlice, FullContent, LineSlice,
+                                                 PageSlice, parse_slice, slice_from_dict, TimeSlice,
+                                                 UnknownSlice)
 from cjm_substrate.core.errors import CapabilityInputError
 
 

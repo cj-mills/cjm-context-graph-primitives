@@ -1,6 +1,7 @@
 """Tests for cjm_context_graph_primitives.graph — the graph data nouns.
 
 Projected from the graph notebook's test cell at the c25780e8 flip."""
+
 import json
 import os
 
@@ -8,7 +9,7 @@ from cjm_context_graph_primitives.graph import GraphContext, GraphEdge, GraphNod
 from cjm_context_graph_primitives.locators import FileRef, GraphNodeRef
 from cjm_context_graph_primitives.provenance import SourceRef
 from cjm_context_graph_primitives.slices import CharSlice, TimeSlice
-from cjm_substrate.core.wire import WIRE_KIND_KEY, wire_decode, wire_encode
+from cjm_substrate.core.wire import wire_decode, wire_encode, WIRE_KIND_KEY
 
 REF = SourceRef(locator=FileRef(path="/runs/run_x.json"),
                 content_hash="sha256:ab", slice=CharSlice(0, 10))

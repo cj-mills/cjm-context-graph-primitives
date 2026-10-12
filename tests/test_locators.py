@@ -1,10 +1,10 @@
 """Tests for cjm_context_graph_primitives.locators — typed resource locators (CR-19).
 
 Projected from the locators notebook's test cells at the c25780e8 flip."""
-import pytest
 
-from cjm_context_graph_primitives.locators import (FileRef, GraphNodeRef, UnknownLocator,
-                                                   locator_from_dict)
+import pytest
+from cjm_context_graph_primitives.locators import (FileRef, GraphNodeRef, locator_from_dict,
+                                                   UnknownLocator)
 from cjm_substrate.core.errors import CapabilityInputError
 
 

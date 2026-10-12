@@ -2,19 +2,18 @@
 
 Projected from the query notebook's two test cells at the c25780e8 flip: the
 evidenced core read patterns (documentation-as-test) + result-DTO round-trips."""
+
 import json
 
 import pytest
-
 from cjm_context_graph_primitives.graph import GraphEdge, GraphNode
 from cjm_context_graph_primitives.query import (EdgeQuery, EdgeQueryResult, NodeQuery,
-                                                NodeQueryResult, OrderBy,
-                                                PropertyPredicate, RawQuery,
-                                                RawQueryResult, RelationPredicate,
-                                                SourcePredicate, query_from_dict,
-                                                result_from_dict)
+                                                NodeQueryResult, OrderBy, PropertyPredicate,
+                                                query_from_dict, RawQuery, RawQueryResult,
+                                                RelationPredicate, result_from_dict,
+                                                SourcePredicate)
 from cjm_substrate.core.errors import CapabilityInputError
-from cjm_substrate.core.wire import WIRE_KIND_KEY, wire_decode, wire_encode
+from cjm_substrate.core.wire import wire_decode, wire_encode, WIRE_KIND_KEY
 
 
 def test_evidenced_core_read_patterns_roundtrip():

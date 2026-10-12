@@ -3,7 +3,6 @@
 from pathlib import Path
 
 import pytest
-
 from cjm_context_graph_primitives.journal import (append_op, append_write, compress_cold_segments,
                                                   compress_segment, journal_segments, maybe_rotate,
                                                   read_journal, read_segment, rotate_journal,

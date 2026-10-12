@@ -1,8 +1,8 @@
 """Tests for cjm_context_graph_primitives.provenance — SourceRef (CR-19).
 
 Projected from the provenance notebook's test cell at the c25780e8 flip."""
-import pytest
 
+import pytest
 from cjm_context_graph_primitives.locators import FileRef, GraphNodeRef, UnknownLocator
 from cjm_context_graph_primitives.provenance import SourceRef
 from cjm_context_graph_primitives.slices import CharSlice, TimeSlice
