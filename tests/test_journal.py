@@ -1,7 +1,13 @@
 """The journal core: envelope-agnostic append (append_op) + the append_write wrapper."""
 
-from cjm_context_graph_primitives.journal import (append_op, append_write, journal_segments,
-                                                  maybe_rotate, read_journal, rotate_journal)
+from pathlib import Path
+
+import pytest
+
+from cjm_context_graph_primitives.journal import (append_op, append_write, compress_cold_segments,
+                                                  compress_segment, journal_segments, maybe_rotate,
+                                                  read_journal, read_segment, rotate_journal,
+                                                  write_segment)
 
 
 def test_append_op_envelope_rides_verbatim(tmp_path):
@@ -41,10 +47,10 @@ def test_rotation_family_reads_as_one_journal(tmp_path):
     j = str(tmp_path / "w.writes.jsonl")
     append_op(j, {"verb": "v", "id": "op-1", "args": {"n": 1}})
     cold1 = rotate_journal(j)
-    assert cold1.endswith("w.writes.0001.jsonl")
+    assert cold1.endswith("w.writes.0001.jsonl.xz")  # stored compressed (f1173d0b)
     append_op(j, {"verb": "v", "id": "op-2", "args": {"n": 2}})
     cold2 = rotate_journal(j)
-    assert cold2.endswith("w.writes.0002.jsonl")
+    assert cold2.endswith("w.writes.0002.jsonl.xz")
     append_op(j, {"verb": "v", "id": "op-3", "args": {"n": 3}})
     assert journal_segments(j) == [cold1, cold2, j]
     assert [op["id"] for op in read_journal(j)] == ["op-1", "op-2", "op-3"]
@@ -60,6 +66,53 @@ def test_maybe_rotate_budget_and_cross_segment_dedup(tmp_path):
     append_op(j, {"verb": "v", "id": "op-2", "args": {}})
     assert not append_op(j, {"verb": "v", "id": "op-1", "args": {}})  # id dedup spans segments
     assert len(journal_segments(j)) == 2 and len(read_journal(j)) == 2
+
+
+def test_rotation_compresses_cold_segments_losslessly(tmp_path):
+    """A closed segment is stored xz-compressed (f1173d0b): the plain copy goes only once
+    proven, and the family reads exactly as before; the sweep converts a plain backlog."""
+    j = str(tmp_path / "w.jsonl")
+    for i in range(3):
+        append_op(j, {"verb": "v", "args": {"i": i, "text": "x" * 200}})
+    before = Path(j).read_text()
+    cold = rotate_journal(j)
+    assert cold == str(tmp_path / "w.0001.jsonl.xz") and not (tmp_path / "w.0001.jsonl").exists()
+    assert read_segment(cold) == before
+    assert [o["args"]["i"] for o in read_journal(j)] == [0, 1, 2]
+    append_op(j, {"verb": "v", "args": {"i": 3}})
+    plain = rotate_journal(j, compress=False)                    # the pre-compression shape
+    assert plain == str(tmp_path / "w.0002.jsonl")
+    rows = compress_cold_segments(j)
+    assert [r["segment"] for r in rows] == [str(tmp_path / "w.0002.jsonl.xz")]
+    assert compress_cold_segments(j) == []                       # idempotent
+    assert [o["args"]["i"] for o in read_journal(j)] == [0, 1, 2, 3]
+    assert not append_op(j, {"verb": "v", "args": {"i": 1, "text": "x" * 200}})  # dedup reads compressed segments
+
+
+def test_crashed_swap_lists_the_plain_segment_until_finished(tmp_path):
+    """Both forms of one index (a crash before the unlink): the plain original is listed,
+    once, and the sweep finishes the swap; the live tail is never compressed."""
+    j = str(tmp_path / "w.jsonl")
+    append_op(j, {"verb": "v", "args": {"i": 0}})
+    plain = rotate_journal(j, compress=False)
+    write_segment(plain + ".xz", Path(plain).read_text())
+    assert journal_segments(j) == [plain]
+    compress_cold_segments(j)
+    assert journal_segments(j) == [plain + ".xz"] and len(read_journal(j)) == 1
+    append_op(j, {"verb": "v", "args": {"i": 1}})
+    with pytest.raises(ValueError, match="not a cold segment"):
+        compress_segment(j)
+    assert rotate_journal(j) == str(tmp_path / "w.0002.jsonl.xz")  # numbering sees compressed indexes
+
+
+def test_write_segment_keeps_the_segment_encoding(tmp_path):
+    """A maintenance rewrite (compaction) lands in the segment's own encoding."""
+    xz, plain = str(tmp_path / "w.0001.jsonl.xz"), str(tmp_path / "w.0002.jsonl")
+    write_segment(xz, '{"verb": "v"}\n')
+    write_segment(plain, '{"verb": "w"}\n')
+    assert Path(xz).read_bytes()[:6] == b"\xfd7zXZ\x00" and read_segment(xz) == '{"verb": "v"}\n'
+    assert Path(plain).read_text() == read_segment(plain) == '{"verb": "w"}\n'
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_op_clock_reads_once_nests_and_stamps_the_op(tmp_path):

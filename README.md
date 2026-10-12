@@ -26,6 +26,8 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 
 - `append_op` _function_ — Append one op record — the envelope-agnostic core `append_write` wraps.
 - `append_write` _function_ — Append one write op (skipping an exact (verb,args) duplicate).
+- `compress_cold_segments` _function_ — Compress every PLAIN cold segment of a family (the live tail is never touched).
+- `compress_segment` _function_ — Store one cold segment xz-compressed, proven lossless before the plain copy goes.
 - `current_session` _function_ — The session key stamped on journal appends (provenance, not replay input).
 - `journal_segments` _function_ — The journal's SEGMENT FAMILY: rotated cold segments + the live tail.
 - `maybe_rotate` _function_ — Rotate the live tail once it reaches the budget (the POST-append check).
@@ -33,7 +35,9 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 - `op_clocked` _function_ — Decorator form of `op_clock` for a write entry point (sync or async): every db write
 - `op_now` _function_ — The op clock's current value: every write-path time reads THIS, never `time.time()`.
 - `read_journal` _function_ — Read every journaled write op across the SEGMENT FAMILY (one JSON object per
+- `read_segment` _function_ — Read one journal segment's text, plain or xz-compressed.
 - `rotate_journal` _function_ — Close the live tail into the next immutable cold segment (explicit rotation).
+- `write_segment` _function_ — Write one segment atomically, in its own encoding (plain or xz-compressed).
 
 ### `cjm_context_graph_primitives.locators`
 

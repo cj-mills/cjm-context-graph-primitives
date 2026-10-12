@@ -10,7 +10,9 @@ append order, session stamping for provenance, and the OP CLOCK every write read
 import functools
 import inspect
 import json
+import lzma
 import os
+import re
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -73,7 +75,7 @@ def read_journal(
     line; missing files = []) — cold segments first, live tail last: append order."""
     ops: List[Dict[str, Any]] = []
     for seg in journal_segments(path):
-        for line in Path(seg).read_text().splitlines():
+        for line in read_segment(seg).splitlines():
             line = line.strip()
             if line:
                 ops.append(json.loads(line))
@@ -158,32 +160,124 @@ def journal_segments(
     repartition only: reading the family in order is byte-identical to the
     unrotated journal, so replay semantics never change and genesis stays
     one-time in segment 0001. Durability motive: GitHub hard-blocks blobs at
-    100MB; rotation keeps every journal file small forever."""
+    100MB; rotation keeps every journal file small forever. A cold segment may be
+    stored COMPRESSED as `<stem>.NNNN.jsonl.xz` (ruling f1173d0b) — one path per
+    index either way; when both forms exist (a swap that crashed before its unlink)
+    the PLAIN one is listed, the original, until `compress_cold_segments` finishes it.
+    Read a listed segment with `read_segment`, never `Path.read_text`."""
     p = Path(path)
     stem, suffix = _stem_suffix(p.name)
-    cold = sorted(q for q in p.parent.glob(f"{stem}.[0-9][0-9][0-9][0-9]{suffix}") if q.is_file())
+    by_index: Dict[str, Path] = {}
+    for pattern in (f"{stem}.[0-9][0-9][0-9][0-9]{suffix}.xz",
+                    f"{stem}.[0-9][0-9][0-9][0-9]{suffix}"):
+        for q in p.parent.glob(pattern):          # plain globbed second: it wins its index
+            if q.is_file():
+                by_index[q.name[len(stem) + 1:len(stem) + 5]] = q
+    cold = [by_index[k] for k in sorted(by_index)]
     return [str(q) for q in cold] + ([str(p)] if p.exists() else [])
 
 
+def read_segment(
+    seg: str,  # A segment path — plain `.jsonl`, or a compressed cold `.jsonl.xz`
+) -> str:  # The segment's text (a compressed one decompressed: byte-identical to its plain original)
+    """Read one journal segment's text, plain or xz-compressed.
+
+    A cold segment may be stored xz-compressed (ruling f1173d0b) — an encoding of the same
+    bytes, never a change to its records — so every reader of a listed segment goes through
+    here."""
+    data = Path(seg).read_bytes()
+    if seg.endswith(".xz"):
+        data = lzma.decompress(data)
+    return data.decode("utf-8")
+
+
+def write_segment(
+    seg: str,   # The segment path; a `.xz` path is written compressed
+    text: str,  # The segment's full text
+) -> None:
+    """Write one segment atomically, in its own encoding (plain or xz-compressed).
+
+    tmp + fsync + os.replace — the path a maintenance rewrite (compaction, a7617bd4) takes,
+    so a compressed segment stays compressed and a plain one plain."""
+    data = text.encode("utf-8")
+    if seg.endswith(".xz"):
+        data = lzma.compress(data, preset=9)
+    tmp = seg + ".tmp"
+    with open(tmp, "wb") as out:
+        out.write(data)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, seg)
+
+
 def rotate_journal(
-    path: str,  # The live journal path — its content becomes the next cold segment
+    path: str,             # The live journal path — its content becomes the next cold segment
+    compress: bool = True, # Store the closed segment xz-compressed (ruling f1173d0b)
 ) -> Optional[str]:  # The cold segment path minted, or None (missing/empty tail)
     """Close the live tail into the next immutable cold segment (explicit rotation).
 
-    Rename-only: no bytes are rewritten, so the family concatenation — and
-    therefore replay — is untouched. `append_op` auto-rotates past the size
-    budget via `maybe_rotate`; this explicit verb exists for migration splits
-    and manual closes. Cold segments are part of the journal — the never-delete
-    rule covers every segment, not just the live tail."""
+    A rename, then (by default) the segment is stored compressed by `compress_segment`:
+    its bytes are re-ENCODED, never rewritten — decompressing reproduces them exactly,
+    so the family read — and therefore replay — is untouched. `append_op` auto-rotates
+    past the size budget via `maybe_rotate`; this explicit verb exists for migration
+    splits and manual closes. Cold segments are part of the journal — the never-delete
+    rule covers every segment, not just the live tail (the plain copy is removed only
+    once its compressed form is proven)."""
     p = Path(path)
     if not p.exists() or p.stat().st_size == 0:
         return None
     stem, suffix = _stem_suffix(p.name)
     taken = (int(q.name[len(stem) + 1:len(stem) + 5])
-             for q in p.parent.glob(f"{stem}.[0-9][0-9][0-9][0-9]{suffix}"))
+             for pattern in (f"{stem}.[0-9][0-9][0-9][0-9]{suffix}",
+                             f"{stem}.[0-9][0-9][0-9][0-9]{suffix}.xz")
+             for q in p.parent.glob(pattern))
     cold = p.with_name(f"{stem}.{max(taken, default=0) + 1:04d}{suffix}")
     p.rename(cold)
-    return str(cold)
+    return compress_segment(str(cold)) if compress else str(cold)
+
+
+def compress_segment(
+    seg: str,  # A PLAIN cold segment (`<stem>.NNNN.jsonl`) — never the live tail
+) -> str:  # The compressed segment's path (`<seg>.xz`)
+    """Store one cold segment xz-compressed, proven lossless before the plain copy goes.
+
+    Ruling f1173d0b: write `<seg>.xz` beside it, PROVE it (decompressed == the original
+    bytes), and only then remove the plain copy. Lossless by construction — the family
+    reads byte-identical, so replay never changes; a crash before the unlink leaves both
+    forms and `journal_segments` lists the plain one until a re-run finishes the swap.
+    Preset 9, measured at the ruling: ~58x on the dev source journal, ~7x on the writes
+    journals, ~0.05 s to decompress a 32 MB segment."""
+    src = Path(seg)
+    if not re.search(r"\.[0-9]{4}(\.jsonl)?$", src.name):
+        raise ValueError(f"compress_segment: {seg} is not a cold segment (<stem>.NNNN.jsonl) "
+                         f"— the live tail is never compressed")
+    data = src.read_bytes()
+    dst = seg + ".xz"
+    write_segment(dst, data.decode("utf-8"))
+    if lzma.decompress(Path(dst).read_bytes()) != data:
+        Path(dst).unlink()
+        raise ValueError(f"compress_segment: {dst} does not decompress to {seg} — "
+                         f"the plain segment is kept")
+    src.unlink()
+    return dst
+
+
+def compress_cold_segments(
+    path: str,  # The live journal path (the family's tail)
+) -> List[Dict[str, Any]]:  # One row per segment compressed: {segment, bytes_before, bytes_after}
+    """Compress every PLAIN cold segment of a family (the live tail is never touched).
+
+    The one-time conversion of the segments rotated before compression, and the recovery
+    for a rotation that crashed mid-swap. Idempotent: a compressed family yields []."""
+    tail = str(Path(path))
+    rows: List[Dict[str, Any]] = []
+    for seg in journal_segments(path):
+        if seg == tail or seg.endswith(".xz"):
+            continue
+        before = os.path.getsize(seg)
+        dst = compress_segment(seg)
+        rows.append({"segment": dst, "bytes_before": before, "bytes_after": os.path.getsize(dst)})
+    return rows
 
 
 def maybe_rotate(
