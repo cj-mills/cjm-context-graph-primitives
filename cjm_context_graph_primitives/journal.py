@@ -19,6 +19,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
+from cjm_context_graph_primitives.timings import span, timed
+
 # THE OP CLOCK (design 8f6f2343, finding fbce0173; the replay window of 0d50b921 moved down
 # here). One op has ONE time: its journaled `ts`. Replay opens this window at each op's ts; a
 # live write opens it with ONE clock read (`op_clock`) around its db write and its appends, so
@@ -74,11 +76,15 @@ def read_journal(
     """Read every journaled write op across the SEGMENT FAMILY (one JSON object per
     line; missing files = []) — cold segments first, live tail last: append order."""
     ops: List[Dict[str, Any]] = []
-    for seg in journal_segments(path):
-        for line in read_segment(seg).splitlines():
-            line = line.strip()
-            if line:
-                ops.append(json.loads(line))
+    with span("read_journal") as measured:  # the instrument (681604c1): a whole-history read
+        for seg in journal_segments(path):
+            text = read_segment(seg)
+            measured["bytes"] = measured.get("bytes", 0) + len(text)
+            for line in text.splitlines():
+                line = line.strip()
+                if line:
+                    ops.append(json.loads(line))
+        measured["ops"] = len(ops)
     return ops
 
 
@@ -105,6 +111,7 @@ def current_session() -> Optional[str]:  # The active session key, or None
     return os.environ.get("CJM_SESSION") or None
 
 
+@timed("append_op")
 def append_op(
     path: str,           # Journal file path (JSONL)
     op: Dict[str, Any],  # The full op record — requires `verb`; envelope fields ride verbatim
@@ -210,6 +217,7 @@ def write_segment(
     os.replace(tmp, seg)
 
 
+@timed("rotate_journal")
 def rotate_journal(
     path: str,             # The live journal path — its content becomes the next cold segment
     compress: bool = True, # Store the closed segment xz-compressed (ruling f1173d0b)
@@ -236,6 +244,7 @@ def rotate_journal(
     return compress_segment(str(cold)) if compress else str(cold)
 
 
+@timed("compress_segment")
 def compress_segment(
     seg: str,  # A PLAIN cold segment (`<stem>.NNNN.jsonl`) — never the live tail
 ) -> str:  # The compressed segment's path (`<seg>.xz`)

@@ -13,6 +13,7 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 - **`cjm_context_graph_primitives.provenance`** — SourceRef - the cross-cutting provenance reference (CR-19). Identity = content_hash (PRIMARY); location = locator; region = optional atomic typed slice. verify() is hash-based regardless of whether the locator still resolves - the structural fix for dangling row-id provenance (cache-hit rows; ledgers E13/D3).
 - **`cjm_context_graph_primitives.query`** — The structured typed query expression (pass-2 Thread 5) - DATA nouns describing graph reads. Execution lives in graph-storage adapters (stage 4 translates expressions per-backend); this library only defines, validates, and (de)serializes them. Typed expressions are the primary, portable surface - no storage-schema leak (the raw-SQL nodes/edges + json_extract coupling of ledger C2/C3), and scale-shaped (server-side filter/page/count answering D13). RawQuery is the explicitly-marked, backend-coupled escape hatch: recurring raw patterns EXPOSE missing typed-expression capabilities.
 - **`cjm_context_graph_primitives.slices`** — Atomic typed content slices - WHAT REGION of the located resource a reference consumes. The slice KIND selects the content facet on multi-facet nodes (TimeSlice -> audio, CharSlice -> text), which dissolves the chunk-local-vs-source-coordinate ambiguity without a frame field (pass-2 Thread 2).
+- **`cjm_context_graph_primitives.timings`** — THE INSTRUMENT's collector: phase spans and the storage door's accumulator for ONE run.
 
 ## API
 
@@ -76,6 +77,19 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 - `UnknownSlice` _class_ — Lossless carrier for a slice kind this library version does not know.
 - `parse_slice` _function_ — Parse a canonical slice string into a typed slice.
 - `slice_from_dict` _function_ — Reconstruct a typed slice from its wire dict.
+
+### `cjm_context_graph_primitives.timings`
+
+- `Run` _class_ — One measured run: its identity, the phase table, the storage table, the series.
+- `begin_run` _function_ — Arm a run for the current context; every span and storage call below lands in it.
+- `current_phase` _function_ — The span path a measurement would land under now.
+- `end_run` _function_ — Disarm a run begun with `begin_run` (its tables stay readable for `event`).
+- `process_started` _function_ — When this process started, to ~10 ms: its age (uptime less its start tick, both from
+- `record_series` _function_ — Fold one positioned cost into its bin (the armed run's series; a no-op when none is):
+- `record_storage` _function_ — Fold one storage call into the armed run (a no-op when none is): by method, and -- when
+- `span` _function_ — Measure one phase of the armed run (a no-op yielding a scratch dict when none is).
+- `timed` _function_ — Decorator form of `span` for a function (sync or async): each call is one phase.
+- `timings_path` _function_ — The timings ledger beside a db (`dev-graph.db` -> `dev-graph.timings.jsonl`).
 
 ## Dependencies
 

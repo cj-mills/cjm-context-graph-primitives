@@ -1,0 +1,122 @@
+"""The instrument's collector (design detail 681604c1): phases, the storage table, series, the event."""
+
+import asyncio
+import json
+
+from cjm_context_graph_primitives.journal import append_op, read_journal
+from cjm_context_graph_primitives.timings import (begin_run, CURRENT_RUN, end_run, record_series,
+                                                  record_storage, span, timed, timings_path)
+
+
+def test_unarmed_is_a_no_op():
+    """With no run armed every span / record is a no-op and nothing is retained."""
+    assert CURRENT_RUN.get() is None
+    with span("x") as counters:
+        counters["rows"] = 3
+    record_storage("query_nodes", 0.1, rows_out=5)
+    record_series("replay:assert", 10, 0.1)
+    assert CURRENT_RUN.get() is None
+
+
+def test_spans_nest_and_aggregate_by_path():
+    """Same-path spans fold into one row (calls, inclusive seconds, summed counters)."""
+    run = begin_run("cli", "show")
+    try:
+        with span("verb"):
+            for _ in range(3):
+                with span("read_journal") as counters:
+                    counters["ops"] = 2
+    finally:
+        end_run(run)
+    assert CURRENT_RUN.get() is None
+    assert run.phases["verb"]["calls"] == 1
+    inner = run.phases["verb/read_journal"]
+    assert inner["calls"] == 3 and inner["ops"] == 6
+    assert run.phases["verb"]["s"] >= inner["s"]
+
+
+def test_timed_wraps_sync_and_async():
+    """The decorator measures each call as one phase, sync and async alike."""
+    @timed("sync_step")
+    def f(x):
+        return x + 1
+
+    @timed("async_step")
+    async def g(x):
+        return x * 2
+
+    run = begin_run("cli", "t")
+    try:
+        assert f(1) == 2
+        assert asyncio.run(g(3)) == 6
+    finally:
+        end_run(run)
+    assert run.phases["sync_step"]["calls"] == 1
+    assert run.phases["async_step"]["calls"] == 1
+
+
+def test_storage_by_method_and_whole_scope_by_phase():
+    """A storage call folds by method; a whole-scope one is also kept under its phase."""
+    run = begin_run("cli", "t")
+    try:
+        with span("verb"):
+            record_storage("query_nodes", 0.5, whole=True, rows_out=10, bytes_in=100)
+            record_storage("query_nodes", 0.25, rows_in=2, rows_out=2)
+    finally:
+        end_run(run)
+    row = run.storage["query_nodes"]
+    assert row["calls"] == 2 and row["rows_out"] == 12 and row["bytes_in"] == 100
+    assert run.whole == {"verb :: query_nodes": {"calls": 1, "s": 0.5}}
+
+
+def test_series_bins_by_position():
+    """A positioned cost lands in its bin, so a slope against position is readable."""
+    run = begin_run("cli", "replay")
+    try:
+        for pos in (0, 5, 999, 1000, 2500):
+            record_series("replay:assert", pos, 0.01)
+    finally:
+        end_run(run)
+    bins = run.series["replay:assert"]
+    assert {k: v["calls"] for k, v in bins.items()} == {"0": 3, "1000": 1, "2000": 1}
+
+
+def test_event_shape_and_ledger_round_trip(tmp_path, monkeypatch):
+    """The event carries identity, outcome, tables and covariates; it appends as one line."""
+    monkeypatch.setenv("CJM_RUN_ID", "run-7")
+    monkeypatch.setenv("CJM_ACTOR", "agent:test")
+    run = begin_run("cli", "show", lane="dev")
+    with span("verb"):
+        pass
+    end_run(run)
+    ev = run.event(outcome=0, covariates={"nodes": 10})
+    assert ev["verb"] == "show" and ev["kind"] == "cli" and ev["run_id"] == "run-7"
+    assert ev["outcome"] == 0 and ev["covariates"] == {"nodes": 10}
+    assert ev["attrs"] == {"lane": "dev"} and ev["actor"] == "agent:test"
+    ledger = timings_path(str(tmp_path / "dev-graph.db"))
+    assert ledger.endswith("dev-graph.timings.jsonl")
+    assert append_op(ledger, ev, dedup=False)
+    assert read_journal(ledger)[0]["phases"]["verb"]["calls"] == 1
+
+
+def test_launch_and_import_from_the_wrapper_clock(monkeypatch):
+    """A wrapper's CJM_T0 before this process started becomes the launch phase."""
+    monkeypatch.setenv("CJM_T0", "1")  # long before this process: the launch is the whole gap
+    run = begin_run("cli", "t")
+    end_run(run)
+    assert run.phases["launch"]["s"] > 0 and "import" in run.phases
+
+
+def test_journal_reads_and_appends_are_phases(tmp_path):
+    """The journal core measures its own whole-history reads (ops, bytes) and appends."""
+    j = str(tmp_path / "w.jsonl")
+    run = begin_run("cli", "t")
+    try:
+        append_op(j, {"verb": "v", "args": {"a": 1}})
+        read_journal(j)
+    finally:
+        end_run(run)
+    assert run.phases["append_op"]["calls"] == 1
+    assert run.phases["append_op/read_journal"]["calls"] == 1   # the dedup scan, under its append
+    top = run.phases["read_journal"]
+    assert top["ops"] == 1 and top["bytes"] == len(json.dumps(read_journal(j)[0], sort_keys=True)) + 1
