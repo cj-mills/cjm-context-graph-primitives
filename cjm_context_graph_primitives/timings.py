@@ -96,6 +96,8 @@ class Run:
         self.whole: Dict[str, Dict[str, float]] = {}
         self.series: Dict[str, Dict[str, Dict[str, float]]] = {}
         self.covariates: Optional[Dict[str, Any]] = None  # The growth covariates, once measured
+        self.plan_scans: Dict[str, Dict[str, float]] = {}  # Storage calls whose plan reads a table whole
+        self.plans: Dict[str, Any] = {}  # The storage door's plan per query shape (asked once per run)
         self._token = None
 
     def add(self, path: str, seconds: float, **counters) -> None:
@@ -119,6 +121,8 @@ class Run:
             "pid": os.getpid(), "phases": rounded(self.phases), "storage": rounded(self.storage)}
         if self.whole:
             ev["whole"] = rounded(self.whole)
+        if self.plan_scans:
+            ev["plan_scans"] = rounded(self.plan_scans)
         if self.series:
             ev["series"] = {name: rounded(bins) for name, bins in sorted(self.series.items())}
         if covariates:
@@ -211,16 +215,22 @@ def record_storage(
     method: str,              # The storage method called
     seconds: float,           # Host-observed seconds for the call (submit to result)
     whole: bool = False,      # The call named no ids, endpoints or filter: it read a whole kind / graph
+    scans: Optional[list] = None,  # What its plan reads whole ("nodes" | "edges" | "nodes:label")
     **counters,               # rows_in / rows_out / bytes_in / bytes_out / worker_s / post_s / decode_s
 ) -> None:
     """Fold one storage call into the armed run (a no-op when none is): by method, and -- when
-    the call was whole-scope -- by `<phase> :: <method>`, the guard's evidence of where it ran."""
+    the call was whole-scope -- by `<phase> :: <method>`, the guard's evidence of where it ran;
+    a call whose PLAN reads a table whole, by `<phase> :: <method> :: <what it scans>` (the plan
+    guard, design detail 3bd8673d)."""
     run = CURRENT_RUN.get()
     if run is None:
         return
     _add(run.storage, method, seconds, counters)
     if whole:
         _add(run.whole, f"{current_phase() or '-'} :: {method}", seconds, {})
+    if scans:
+        _add(run.plan_scans, f"{current_phase() or '-'} :: {method} :: {'+'.join(scans)}",
+             seconds, {})
 
 
 def record_series(
