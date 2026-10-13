@@ -207,6 +207,21 @@ class OrderBy:
         return cls(prop=d["prop"], descending=d.get("descending", False))
 
 
+def _check_keyset(
+    q: Any,  # NodeQuery or EdgeQuery
+) -> None:
+    """Refuse a keyset cursor beside an ordering or an offset: `after` pages in id
+    order, so a property ordering would contradict it and an offset would re-scan."""
+    if q.after is None:
+        return
+    if q.order_by is not None:
+        raise CapabilityInputError("`after` pages in id order -- refused beside order_by",
+                                   fields_invalid=["after", "order_by"])
+    if q.offset:
+        raise CapabilityInputError("`after` is the keyset cursor -- refused beside offset",
+                                   fields_invalid=["after", "offset"])
+
+
 @dataclass
 class NodeQuery:
     """Typed node read: filter / traverse / order / page / project / count.
@@ -217,6 +232,12 @@ class NodeQuery:
     property keeps its JSON type (a list stays a list). Projected rows
     ALWAYS carry the structural field `id`; the pseudo-field `"sources"` is
     projectable (the C-2 spine read needs id + properties + sources).
+
+    `after` is the KEYSET cursor: rows whose id sorts after it, in id order —
+    the paging form for a pass over a whole answer (an OFFSET page re-scans to
+    its offset and shifts under a concurrent writer, finding ae2b196e); it is
+    refused beside `order_by` or `offset`. Any bounded read is ordered by the
+    executor (id breaks ties), never an arbitrary subset (finding a107e2f3).
     """
 
     ids: Optional[List[str]] = None              # Batch-by-id (C17); None = no id filter
@@ -229,8 +250,12 @@ class NodeQuery:
     offset: int = 0                              # Page offset
     count: bool = False                          # Return count instead of rows
     project: Optional[List[str]] = None          # Property names (dotted paths ok) + "sources"; None = whole nodes
+    after: Optional[str] = None                  # Keyset cursor: rows with id > after, in id order
 
     TYPE = "node_query"  # Wire-dict type tag
+
+    def __post_init__(self):
+        _check_keyset(self)
 
     def to_dict(self) -> Dict[str, Any]:  # Tagged wire dict
         """Serialize to the wire dict form."""
@@ -246,6 +271,7 @@ class NodeQuery:
             "offset": self.offset,
             "count": self.count,
             "project": self.project,
+            "after": self.after,
         }
 
     @classmethod
@@ -266,6 +292,7 @@ class NodeQuery:
             offset=d.get("offset", 0),
             count=d.get("count", False),
             project=d.get("project"),
+            after=d.get("after"),
         )
 
 
@@ -301,10 +328,12 @@ class EdgeQuery:
     offset: int = 0                       # Page offset
     count: bool = False                   # Return count instead of rows
     project: Optional[List[str]] = None   # Property names (dotted paths ok); None = whole edges
+    after: Optional[str] = None           # Keyset cursor: rows with id > after, in id order (as on NodeQuery)
 
     TYPE = "edge_query"  # Wire-dict type tag
 
     def __post_init__(self):
+        _check_keyset(self)
         if self.source_id is not None and self.source_ids is not None:
             raise CapabilityInputError(
                 "Use source_id OR source_ids, not both",
@@ -334,6 +363,7 @@ class EdgeQuery:
             "offset": self.offset,
             "count": self.count,
             "project": self.project,
+            "after": self.after,
         }
 
     @classmethod
@@ -358,6 +388,7 @@ class EdgeQuery:
             offset=d.get("offset", 0),
             count=d.get("count", False),
             project=d.get("project"),
+            after=d.get("after"),
         )
 
 

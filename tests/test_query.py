@@ -91,6 +91,23 @@ def test_validation_raises_loudly():
         query_from_dict({"type": "graph_query"})
 
 
+def test_keyset_cursor_roundtrips_and_refuses_order_or_offset():
+    # The keyset cursor (findings ae2b196e / a107e2f3): `after` rides the wire on both
+    # query kinds and is refused beside a property ordering or an offset, loudly.
+    for q in (NodeQuery(label="Segment", after="s1", limit=2),
+              EdgeQuery(relation_type="NEXT", after="e1", limit=2)):
+        back = query_from_dict(json.loads(json.dumps(q.to_dict())))
+        assert back.after == q.after and back == q
+    assert NodeQuery.from_dict({"type": "node_query"}).after is None  # older wire dicts read
+    bads = (lambda: NodeQuery(after="s1", order_by=OrderBy("index")),
+            lambda: NodeQuery(after="s1", offset=5),
+            lambda: EdgeQuery(after="e1", order_by=OrderBy("index")),
+            lambda: EdgeQuery(after="e1", offset=5))
+    for bad in bads:
+        with pytest.raises(CapabilityInputError):
+            bad()
+
+
 def test_result_dto_roundtrips():
     node = GraphNode(id="n1", label="Segment", properties={"index": 0, "text": "hi"})
     edge = GraphEdge(id="e1", source_id="n1", target_id="n2", relation_type="NEXT")
