@@ -4,8 +4,9 @@ import asyncio
 import json
 
 from cjm_context_graph_primitives.journal import append_op, read_journal
-from cjm_context_graph_primitives.timings import (begin_run, CURRENT_RUN, end_run, record_series,
-                                                  record_storage, span, timed, timings_path)
+from cjm_context_graph_primitives.timings import (append_event, begin_run, CURRENT_RUN, end_run,
+                                                  record_series, record_storage, Run, span, timed,
+                                                  timings_path)
 
 
 def test_unarmed_is_a_no_op():
@@ -120,3 +121,22 @@ def test_journal_reads_and_appends_are_phases(tmp_path):
     assert run.phases["append_op/read_journal"]["calls"] == 1   # the dedup scan, under its append
     top = run.phases["read_journal"]
     assert top["ops"] == 1 and top["bytes"] == len(json.dumps(read_journal(j)[0], sort_keys=True)) + 1
+
+
+def test_every_run_carries_its_bench_tier(monkeypatch):
+    """A scale-harness run is tagged at birth, whoever begins it (a CLI invocation, a gesture)."""
+    monkeypatch.setenv("CJM_BENCH_TIER", "8")
+    monkeypatch.setenv("CJM_BENCH_LANE", "dev-graph")
+    assert Run("gesture", "app:g").attrs == {"tier": 8, "lane": "dev-graph"}
+    monkeypatch.delenv("CJM_BENCH_TIER")
+    assert Run("gesture", "app:g", app="app").attrs == {"app": "app"}
+
+
+def test_append_event_is_o1_and_fail_open(tmp_path, capsys):
+    """Every run is one event (dedup off); an unwritable ledger warns and never raises."""
+    ledger = str(tmp_path / "g.timings.jsonl")
+    ev = Run("gesture", "app:g").event(outcome="ok")
+    assert append_event(ledger, ev) and append_event(ledger, ev)
+    assert len(read_journal(ledger)) == 2
+    assert append_event(str(tmp_path), ev) is False  # a directory: the open fails
+    assert "timings-ledger append failed" in capsys.readouterr().err

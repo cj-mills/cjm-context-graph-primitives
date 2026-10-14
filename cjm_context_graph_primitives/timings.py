@@ -20,6 +20,7 @@ ledger (ruling d7742c47 (b)).
 import functools
 import inspect
 import os
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -89,6 +90,9 @@ class Run:
         self.name = name
         self.run_id = run_id or os.environ.get("CJM_RUN_ID") or str(uuid.uuid4())
         self.attrs: Dict[str, Any] = dict(attrs)
+        tier = os.environ.get("CJM_BENCH_TIER")
+        if tier:  # a scale-harness run (design detail 3bd8673d): its tier, kept apart from live runs
+            self.attrs.update({"tier": int(tier), "lane": os.environ.get("CJM_BENCH_LANE")})
         self.started = time.time()
         self.t0 = time.perf_counter()
         self.phases: Dict[str, Dict[str, float]] = {}
@@ -246,3 +250,19 @@ def record_series(
         return
     bins = run.series.setdefault(name, {})
     _add(bins, str(position // bin_size * bin_size), seconds, {})
+
+
+def append_event(
+    path: str,              # The timings ledger (JSONL)
+    event: Dict[str, Any],  # One run's event
+) -> bool:  # True when appended
+    """Append one timing event: O(1), dedup off (every run is one event), fail-open -- the
+    instrument must never break the work it measured. The one append every recorder shares
+    (the CLI's invocations, the harness, an app's gestures)."""
+    from cjm_context_graph_primitives.journal import append_op  # the journal imports this module
+    try:
+        return append_op(path, event, dedup=False)
+    except Exception as e:
+        print(f"warning: timings-ledger append failed (the run itself completed): {e}",
+              file=sys.stderr)
+        return False

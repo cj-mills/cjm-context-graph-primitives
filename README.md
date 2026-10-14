@@ -81,6 +81,7 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 ### `cjm_context_graph_primitives.timings`
 
 - `Run` _class_ — One measured run: its identity, the phase table, the storage table, the series.
+- `append_event` _function_ — Append one timing event: O(1), dedup off (every run is one event), fail-open -- the
 - `begin_run` _function_ — Arm a run for the current context; every span and storage call below lands in it.
 - `current_phase` _function_ — The span path a measurement would land under now.
 - `end_run` _function_ — Disarm a run begun with `begin_run` (its tables stay readable for `event`).
