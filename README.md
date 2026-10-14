@@ -85,7 +85,10 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 - `begin_run` _function_ — Arm a run for the current context; every span and storage call below lands in it.
 - `current_phase` _function_ — The span path a measurement would land under now.
 - `end_run` _function_ — Disarm a run begun with `begin_run` (its tables stay readable for `event`).
+- `io_delta` _function_ — The I/O a stretch of work did.
 - `process_started` _function_ — When this process started, to ~10 ms: its age (uptime less its start tick, both from
+- `read_io` _function_ — This process's I/O counters from /proc/self/io (design detail 2f5033bf (1)): read_bytes /
+- `record_append` _function_ — Fold one journal append into the armed run (a no-op when none is): ops and bytes per
 - `record_series` _function_ — Fold one positioned cost into its bin (the armed run's series; a no-op when none is):
 - `record_storage` _function_ — Fold one storage call into the armed run (a no-op when none is): by method, and -- when
 - `span` _function_ — Measure one phase of the armed run (a no-op yielding a scratch dict when none is).

@@ -3,10 +3,11 @@
 import asyncio
 import json
 
+import pytest
 from cjm_context_graph_primitives.journal import append_op, read_journal
 from cjm_context_graph_primitives.timings import (append_event, begin_run, CURRENT_RUN, end_run,
-                                                  record_series, record_storage, Run, span, timed,
-                                                  timings_path)
+                                                  io_delta, read_io, record_append, record_series,
+                                                  record_storage, Run, span, timed, timings_path)
 
 
 def test_unarmed_is_a_no_op():
@@ -140,3 +141,26 @@ def test_append_event_is_o1_and_fail_open(tmp_path, capsys):
     assert len(read_journal(ledger)) == 2
     assert append_event(str(tmp_path), ev) is False  # a directory: the open fails
     assert "timings-ledger append failed" in capsys.readouterr().err
+
+
+def test_io_counters_and_journal_appends_ride_the_event(tmp_path):
+    """Design detail 2f5033bf (1): a run's event carries the process's I/O over the run and its
+    journal appends (ops and bytes per file) -- a duplicate append is never counted."""
+    io = read_io()
+    if io is None:
+        pytest.skip("no /proc/self/io (Linux)")
+    assert {"read_bytes", "write_bytes", "rchar", "wchar"} <= set(io)
+    assert io_delta({"wchar": 5}, {"wchar": 12, "rchar": 3}) == {"wchar": 7, "rchar": 3}
+    assert io_delta(None, io) is None
+    journal = tmp_path / "x.writes.jsonl"
+    run = begin_run("cli", "decide")
+    try:
+        append_op(str(journal), {"verb": "decide", "args": {"statement": "s"}})
+        append_op(str(journal), {"verb": "decide", "args": {"statement": "s"}})  # a duplicate
+        (tmp_path / "blob").write_bytes(b"x" * 4096)
+    finally:
+        end_run(run)
+    ev = run.event(outcome=0)
+    assert ev["appended"] == {"x.writes.jsonl": {"ops": 1, "bytes": journal.stat().st_size}}
+    assert ev["io"]["wchar"] >= 4096 + journal.stat().st_size
+    record_append(str(journal), 10)  # nothing armed: a no-op

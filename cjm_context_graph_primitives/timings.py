@@ -57,6 +57,28 @@ def process_started() -> Optional[float]:  # Unix seconds this process started, 
         return None
 
 
+def read_io() -> Optional[Dict[str, int]]:  # This process's I/O counters, or None when unreadable
+    """This process's I/O counters from /proc/self/io (design detail 2f5033bf (1)): read_bytes /
+    write_bytes are what reached the block layer, rchar / wchar what the process asked to read and
+    write, syscr / syscw its read and write calls. A reaped child's counters accrue to its parent,
+    so a CLI run's delta covers its graph worker once the worker is reaped. None off Linux."""
+    try:
+        with open("/proc/self/io") as f:
+            return {k.strip(): int(v) for k, v in (line.split(":", 1) for line in f if ":" in line)}
+    except Exception:
+        return None
+
+
+def io_delta(
+    before: Optional[Dict[str, int]],  # `read_io` at the start
+    after: Optional[Dict[str, int]],   # `read_io` at the end
+) -> Optional[Dict[str, int]]:  # after less before, counter by counter; None when either is missing
+    """The I/O a stretch of work did."""
+    if not before or not after:
+        return None
+    return {k: v - before.get(k, 0) for k, v in after.items()}
+
+
 def _env_float(name: str) -> Optional[float]:  # A float env var, or None
     try:
         return float(os.environ[name])
@@ -93,6 +115,10 @@ class Run:
         tier = os.environ.get("CJM_BENCH_TIER")
         if tier:  # a scale-harness run (design detail 3bd8673d): its tier, kept apart from live runs
             self.attrs.update({"tier": int(tier), "lane": os.environ.get("CJM_BENCH_LANE")})
+            load = os.environ.get("CJM_BENCH_LOAD")
+            if load:  # a concurrent replay run (design detail 2f5033bf (2)): its load, client count, client
+                self.attrs.update({"load": load, "clients": int(os.environ.get("CJM_BENCH_CLIENTS") or 0),
+                                   "client": int(os.environ.get("CJM_BENCH_CLIENT") or 0)})
         self.started = time.time()
         self.t0 = time.perf_counter()
         self.phases: Dict[str, Dict[str, float]] = {}
@@ -102,6 +128,8 @@ class Run:
         self.covariates: Optional[Dict[str, Any]] = None  # The growth covariates, once measured
         self.plan_scans: Dict[str, Dict[str, float]] = {}  # Storage calls whose plan reads a table whole
         self.plans: Dict[str, Any] = {}  # The storage door's plan per query shape (asked once per run)
+        self.appended: Dict[str, Dict[str, int]] = {}  # Journal appends per file: ops, bytes (the logical size)
+        self.io0 = read_io()  # The process's I/O counters at the run's start (design detail 2f5033bf (1))
         self._token = None
 
     def add(self, path: str, seconds: float, **counters) -> None:
@@ -129,6 +157,11 @@ class Run:
             ev["plan_scans"] = rounded(self.plan_scans)
         if self.series:
             ev["series"] = {name: rounded(bins) for name, bins in sorted(self.series.items())}
+        io = io_delta(self.io0, read_io())
+        if io:
+            ev["io"] = io  # the process's I/O over the run (a gesture's is process-wide: an upper bound)
+        if self.appended:
+            ev["appended"] = {k: dict(v) for k, v in sorted(self.appended.items())}
         if covariates:
             ev["covariates"] = covariates
         if self.attrs:
@@ -250,6 +283,21 @@ def record_series(
         return
     bins = run.series.setdefault(name, {})
     _add(bins, str(position // bin_size * bin_size), seconds, {})
+
+
+def record_append(
+    path: str,    # The journal appended to (its live path)
+    nbytes: int,  # Bytes appended: the op's line
+) -> None:
+    """Fold one journal append into the armed run (a no-op when none is): ops and bytes per
+    journal file -- a write's logical size, the denominator of its write amplification (design
+    detail 2f5033bf (1))."""
+    run = CURRENT_RUN.get()
+    if run is None:
+        return
+    row = run.appended.setdefault(Path(path).name, {"ops": 0, "bytes": 0})
+    row["ops"] += 1
+    row["bytes"] += nbytes
 
 
 def append_event(

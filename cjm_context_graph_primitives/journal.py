@@ -19,7 +19,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
-from cjm_context_graph_primitives.timings import span, timed
+from cjm_context_graph_primitives.timings import record_append, span, timed
 
 # THE OP CLOCK (design 8f6f2343, finding fbce0173; the replay window of 0d50b921 moved down
 # here). One op has ONE time: its journaled `ts`. Replay opens this window at each op's ts; a
@@ -143,8 +143,10 @@ def append_op(
         record["session"] = session
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, sort_keys=True) + "\n"
     with p.open("a") as f:
-        f.write(json.dumps(record, sort_keys=True) + "\n")
+        f.write(line)
+    record_append(path, len(line.encode("utf-8")))  # the instrument's logical bytes (2f5033bf (1))
     maybe_rotate(path)  # post-append: a fat op lands, then closes its segment
     return True
 
