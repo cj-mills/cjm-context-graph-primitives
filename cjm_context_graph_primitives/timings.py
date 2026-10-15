@@ -117,6 +117,9 @@ class Run:
         tier = os.environ.get("CJM_BENCH_TIER")
         if tier:  # a scale-harness run (design detail 3bd8673d): its tier, kept apart from live runs
             self.attrs.update({"tier": int(tier), "lane": os.environ.get("CJM_BENCH_LANE")})
+            cache = os.environ.get("CJM_BENCH_CACHE")
+            if cache:  # the harness's cache condition (ruling b7b3976f (B)): cold, then warm
+                self.attrs["cache"] = cache
             load = os.environ.get("CJM_BENCH_LOAD")
             if load:  # a concurrent replay run (design detail 2f5033bf (2)): its load, client count, client
                 self.attrs.update({"load": load, "clients": int(os.environ.get("CJM_BENCH_CLIENTS") or 0),

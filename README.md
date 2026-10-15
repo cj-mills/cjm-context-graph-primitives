@@ -89,9 +89,10 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 - `process_started` _function_ — When this process started, to ~10 ms: its age (uptime less its start tick, both from
 - `read_io` _function_ — This process's I/O counters from /proc/self/io (design detail 2f5033bf (1)): read_bytes /
 - `record_append` _function_ — Fold one journal append into the armed run (a no-op when none is): ops and bytes per
+- `record_replay` _function_ — Fold one replayed op into the armed run (a no-op when none is): ops and bytes per journal
 - `record_series` _function_ — Fold one positioned cost into its bin (the armed run's series; a no-op when none is):
 - `record_storage` _function_ — Fold one storage call into the armed run (a no-op when none is): by method, and -- when
-- `span` _function_ — Measure one phase of the armed run (a no-op yielding a scratch dict when none is).
+- `span` _function_ — Measure one phase of the armed run (a no-op yielding a scratch dict when none is). A
 - `timed` _function_ — Decorator form of `span` for a function (sync or async): each call is one phase.
 - `timings_path` _function_ — The timings ledger beside a db (`dev-graph.db` -> `dev-graph.timings.jsonl`).
 
