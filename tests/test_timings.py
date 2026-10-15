@@ -6,8 +6,9 @@ import json
 import pytest
 from cjm_context_graph_primitives.journal import append_op, read_journal
 from cjm_context_graph_primitives.timings import (append_event, begin_run, CURRENT_RUN, end_run,
-                                                  io_delta, read_io, record_append, record_series,
-                                                  record_storage, Run, span, timed, timings_path)
+                                                  io_delta, read_io, record_append, record_replay,
+                                                  record_series, record_storage, Run, span, timed,
+                                                  timings_path)
 
 
 def test_unarmed_is_a_no_op():
@@ -164,3 +165,22 @@ def test_io_counters_and_journal_appends_ride_the_event(tmp_path):
     assert ev["appended"] == {"x.writes.jsonl": {"ops": 1, "bytes": journal.stat().st_size}}
     assert ev["io"]["wchar"] >= 4096 + journal.stat().st_size
     record_append(str(journal), 10)  # nothing armed: a no-op
+
+
+def test_replayed_ops_ride_the_event_at_their_journaled_size(tmp_path):
+    """Ruling 9af0e42e (3): a replay's logical size is the journal bytes of the ops it applied --
+    each op folded at its journaled line's size, per journal file; a no-op when nothing is armed."""
+    journal = tmp_path / "x.writes.jsonl"
+    append_op(str(journal), {"verb": "decide", "args": {"statement": "s", "n": 1.5}})
+    append_op(str(journal), {"verb": "assert", "args": {"subject": "a", "value": "é"}})
+    ops = read_journal(str(journal))
+    run = begin_run("cli", "replay")
+    try:
+        for op in ops:
+            record_replay(str(journal), op)
+    finally:
+        end_run(run)
+    ev = run.event(outcome=0)
+    assert ev["replayed"] == {"x.writes.jsonl": {"ops": 2, "bytes": journal.stat().st_size}}
+    assert "appended" not in ev
+    record_replay(str(journal), ops[0])  # nothing armed: a no-op

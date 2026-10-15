@@ -19,6 +19,7 @@ ledger (ruling d7742c47 (b)).
 
 import functools
 import inspect
+import json
 import os
 import sys
 import time
@@ -33,6 +34,7 @@ from typing import Any, Dict, Iterator, Optional, Tuple
 # shared object, so every task's measurements land in the same event.
 CURRENT_RUN: ContextVar[Optional["Run"]] = ContextVar("cjm_timings_run", default=None)
 _PATH: ContextVar[Tuple[str, ...]] = ContextVar("cjm_timings_path", default=())
+IO_PHASE_COUNTERS = ("write_bytes", "cancelled_write_bytes", "wchar")  # The disk bytes a top-level phase carries
 
 LEDGER_SUFFIX = ".timings.jsonl"  # The ledger beside a db: <db stem>.timings.jsonl
 
@@ -129,6 +131,7 @@ class Run:
         self.plan_scans: Dict[str, Dict[str, float]] = {}  # Storage calls whose plan reads a table whole
         self.plans: Dict[str, Any] = {}  # The storage door's plan per query shape (asked once per run)
         self.appended: Dict[str, Dict[str, int]] = {}  # Journal appends per file: ops, bytes (the logical size)
+        self.replayed: Dict[str, Dict[str, int]] = {}  # Journal ops replayed per file: ops, bytes (a replay's logical size)
         self.io0 = read_io()  # The process's I/O counters at the run's start (design detail 2f5033bf (1))
         self._token = None
 
@@ -162,6 +165,8 @@ class Run:
             ev["io"] = io  # the process's I/O over the run (a gesture's is process-wide: an upper bound)
         if self.appended:
             ev["appended"] = {k: dict(v) for k, v in sorted(self.appended.items())}
+        if self.replayed:
+            ev["replayed"] = {k: dict(v) for k, v in sorted(self.replayed.items())}
         if covariates:
             ev["covariates"] = covariates
         if self.attrs:
@@ -205,7 +210,10 @@ def end_run(run: Run) -> None:
 def span(
     name: str,  # The phase's name; nested spans join their parents' names with "/"
 ) -> Iterator[Dict[str, Any]]:  # A dict the block may add counters to (rows, bytes, ops ...)
-    """Measure one phase of the armed run (a no-op yielding a scratch dict when none is)."""
+    """Measure one phase of the armed run (a no-op yielding a scratch dict when none is). A
+    top-level phase also carries its disk bytes -- write_bytes, cancelled_write_bytes and wchar
+    over the phase (finding 7345f40d: a run's bytes attributed to the phase that wrote them; a
+    reaped worker's land in the phase that reaped it)."""
     run = CURRENT_RUN.get()
     counters: Dict[str, Any] = {}
     if run is None:
@@ -214,10 +222,14 @@ def span(
     path = _PATH.get() + (name,)
     token = _PATH.set(path)
     t = time.perf_counter()
+    io0 = read_io() if len(path) == 1 else None
     try:
         yield counters
     finally:
         _PATH.reset(token)
+        d = io_delta(io0, read_io())
+        if d:
+            counters.update({k: d[k] for k in IO_PHASE_COUNTERS if k in d})
         _add(run.phases, "/".join(path), time.perf_counter() - t, counters)
 
 
@@ -298,6 +310,22 @@ def record_append(
     row = run.appended.setdefault(Path(path).name, {"ops": 0, "bytes": 0})
     row["ops"] += 1
     row["bytes"] += nbytes
+
+
+def record_replay(
+    path: str,           # The journal replayed (its live path)
+    op: Dict[str, Any],  # One op the replay applied
+) -> None:
+    """Fold one replayed op into the armed run (a no-op when none is): ops and bytes per journal
+    file, each op at its journaled line's size -- a replay's logical size, the denominator of its
+    write amplification (ruling 9af0e42e (3): the tail at most 32x over the journal bytes it
+    replays)."""
+    run = CURRENT_RUN.get()
+    if run is None:
+        return
+    row = run.replayed.setdefault(Path(path).name, {"ops": 0, "bytes": 0})
+    row["ops"] += 1
+    row["bytes"] += len((json.dumps(op, sort_keys=True) + "\n").encode("utf-8"))
 
 
 def append_event(
