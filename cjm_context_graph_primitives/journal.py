@@ -31,6 +31,13 @@ from cjm_context_graph_primitives.timings import record_append, span, timed
 # this object, so replay and live share one variable.
 PROVENANCE_TS: ContextVar[Optional[float]] = ContextVar("provenance_ts", default=None)
 
+# THE APPLIED-FIRST MARK (design detail 65f4a6c9, eeda5977 leg L2): a record `append_write` lands
+# was APPLIED BEFORE its append -- the apply-then-append order the write order retires, verb by
+# verb. A writer's heal (writer.JournalWriter) advances past such a record and never re-applies
+# it: its db already holds it, through a live path replay's applier may not reproduce. Replay
+# ignores the mark (a rebuild applies every record).
+APPLIED_FIRST = "applied_first"
+
 
 def op_now() -> float:  # The open window's ts, else a fresh clock read
     """The op clock's current value: every write-path time reads THIS, never `time.time()`."""
@@ -95,11 +102,12 @@ def append_write(
     verb: str,        # The write verb ("decide" | "alias" | "assert")
     args: Dict[str, Any],  # The resolved arguments applied (replay re-passes these verbatim)
 ) -> bool:  # True if appended, False if an identical op was already journaled
-    """Append one write op (skipping an exact (verb,args) duplicate).
+    """Append one write op (skipping an exact (verb,args) duplicate) its caller has ALREADY
+    APPLIED -- the record carries the applied-first mark, so a writer's heal passes it.
 
     Args are the RESOLVED inputs to the core verb (e.g. an alias's discovered
     evidence ids), so replay is deterministic and independent of corpus state."""
-    return append_op(path, {"verb": verb, "args": args})
+    return append_op(path, {"verb": verb, "args": args, APPLIED_FIRST: True})
 
 
 def current_session() -> Optional[str]:  # The active session key, or None

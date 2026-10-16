@@ -154,14 +154,30 @@ def test_a_family_rewritten_under_the_cursor_is_refused(tmp_path):
 
 def test_no_cursor_refuses_and_stamp_adopts_the_end(tmp_path):
     j, cursors, db = str(tmp_path / "w.jsonl"), MemCursors(), MemDb()
-    with pytest.raises(NoCursor):
-        asyncio.run(write_all(j, cursors, db, [put(0)]))
-    assert read_journal(j) == []  # refused before anything was journaled
     Path(j).write_text(json.dumps(put(0), sort_keys=True) + "\n")  # a family the db already holds
+    with pytest.raises(NoCursor):
+        asyncio.run(write_all(j, cursors, db, [put(1)]))
+    assert len(read_journal(j)) == 1 and db.log == []  # refused before anything was journaled
     end = asyncio.run(stamp_cursor(j, cursors))
     assert end.ordinal == 1 and asyncio.run(journal_lag(j, cursors)) == 0
     asyncio.run(write_all(j, cursors, db, [put(1)]))
     assert db.log == ["op-1"]  # the adopted record was not re-applied
+
+
+def test_an_empty_family_needs_no_adoption(tmp_path):
+    j, cursors, db = str(tmp_path / "w.jsonl"), MemCursors(), MemDb()
+    asyncio.run(write_all(j, cursors, db, [put(0), put(1)]))  # no cursor, nothing journaled: the origin
+    assert db.log == ["op-0", "op-1"] and cursors.held["w.jsonl"].ordinal == 2
+
+
+def test_an_applied_first_record_is_passed_never_reapplied(tmp_path):
+    from cjm_context_graph_primitives.journal import append_write
+    j, cursors, db = str(tmp_path / "w.jsonl"), MemCursors(), MemDb()
+    asyncio.run(write_all(j, cursors, db, [put(0)]))
+    append_write(j, "put", {"i": 1})  # an apply-then-append writer: its db already holds the op
+    asyncio.run(write_all(j, cursors, db, [put(2)]))
+    assert db.log == ["op-0", "op-2"]  # passed by the heal, never re-applied
+    assert cursors.held["w.jsonl"].ordinal == 3 and asyncio.run(journal_lag(j, cursors)) == 0
 
 
 def test_a_reader_reports_the_lag_and_applies_nothing(tmp_path):

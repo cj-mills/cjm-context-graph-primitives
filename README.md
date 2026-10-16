@@ -29,7 +29,7 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 - `AppendedRecord` _class_ — One record `append_record` landed, and where: a writer advances its applied cursor to it
 - `append_op` _function_ — Append one op record — the envelope-agnostic core `append_write` wraps; `append_record`
 - `append_record` _function_ — Append one op record and say where it landed — the core `append_op` answers True / False for.
-- `append_write` _function_ — Append one write op (skipping an exact (verb,args) duplicate).
+- `append_write` _function_ — Append one write op (skipping an exact (verb,args) duplicate) its caller has ALREADY
 - `compress_cold_segments` _function_ — Compress every PLAIN cold segment of a family (the live tail is never touched).
 - `compress_segment` _function_ — Store one cold segment xz-compressed, proven lossless before the plain copy goes.
 - `current_session` _function_ — The session key stamped on journal appends (provenance, not replay input).
@@ -107,7 +107,7 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 - `CursorStore` _class_ — Where a db keeps its applied cursors: beside the graph, one per journal family.
 - `JournalPosition` _class_ — How far into a journal family a db has applied: the segment holding the last applied
 - `JournalWriter` _class_ — One writer's unit of work on one journal family (65f4a6c9): `async with` takes the
-- `NoCursor` _class_ — The db holds no applied cursor for the family: it predates the cursor or was built without
+- `NoCursor` _class_ — The db holds no applied cursor for a family that holds records: it predates the cursor or
 - `family_lock` _function_ — The family's exclusive writer lock: an flock on its own open of the lock file, so it
 - `family_name` _function_ — A family is keyed by its live tail's FILE NAME, never its path: a db and its journals move
 - `fault_point` _function_ — A crash-injection point on the write path: the in-process hook, then the armed env.

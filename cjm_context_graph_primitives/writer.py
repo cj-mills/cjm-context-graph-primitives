@@ -29,7 +29,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple
 
-from cjm_context_graph_primitives.journal import append_record, indexed_segments, PROVENANCE_TS
+from cjm_context_graph_primitives.journal import (append_record, APPLIED_FIRST, indexed_segments,
+                                                  PROVENANCE_TS)
 
 # THE CRASH POINTS (the proof of 65f4a6c9): a test sets FAULT_HOOK (it raises, simulating the
 # crash in-process); a proof arms CJM_JOURNAL_FAULT=<point> in a child process, which then dies
@@ -88,8 +89,10 @@ class CursorMismatch(RuntimeError):
 
 
 class NoCursor(RuntimeError):
-    """The db holds no applied cursor for the family: it predates the cursor or was built without
-    one. `stamp_cursor` adopts the family's end once the db is known to hold the whole family."""
+    """The db holds no applied cursor for a family that holds records: it predates the cursor or
+    was built without one. `stamp_cursor` adopts the family's end once the db is known to hold the
+    whole family. An EMPTY family needs no adoption: the origin is its cursor (nothing journaled,
+    so nothing the db can lack)."""
 
 
 class CursorStore(Protocol):
@@ -250,6 +253,9 @@ class JournalWriter:
 
     async def _heal(self) -> int:  # Records applied past the cursor
         position = await self.cursors.read(self.family)
+        if position is None and not read_tail(self.path, ORIGIN):
+            position = ORIGIN  # an empty family: nothing journaled, so nothing the db can lack
+            await self.cursors.record(self.family, ORIGIN)  # durable: a later append lags it, never orphans it
         if position is None:
             raise NoCursor(
                 f"{self.family}: the db holds no applied cursor -- it predates the cursor or was "
@@ -257,10 +263,13 @@ class JournalWriter:
                 f"once the db is known to hold the whole family")
         self.position = position
         tail = read_tail(self.path, position)
+        healed = 0
         for record, after in tail:
-            await self._apply(record)
+            if not record.get(APPLIED_FIRST):  # an applied-first record's db already holds it: passed
+                await self._apply(record)
+                healed += 1
             await self._advance(after)
-        return len(tail)
+        return healed
 
     async def _apply(
         self,
