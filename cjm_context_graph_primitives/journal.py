@@ -8,6 +8,7 @@ append order, session stamping for provenance, and the OP CLOCK every write read
 """
 
 import functools
+import hashlib
 import inspect
 import json
 import lzma
@@ -16,8 +17,9 @@ import re
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from cjm_context_graph_primitives.timings import record_append, span, timed
 
@@ -111,13 +113,24 @@ def current_session() -> Optional[str]:  # The active session key, or None
     return os.environ.get("CJM_SESSION") or None
 
 
+@dataclass(frozen=True)
+class AppendedRecord:
+    """One record `append_record` landed, and where: a writer advances its applied cursor to it
+    (design detail 65f4a6c9)."""
+
+    record: Dict[str, Any]  # The op as journaled (ts / session stamped)
+    segment: int            # Family index of the segment holding it (the live tail's at append time)
+    offset: int             # Byte offset just past its line within that segment
+    digest: str             # sha256 of its line, newline included
+
+
 @timed("append_op")
-def append_op(
+def append_record(
     path: str,           # Journal file path (JSONL)
     op: Dict[str, Any],  # The full op record — requires `verb`; envelope fields ride verbatim
     dedup: bool = True,  # Skip an already-journaled duplicate (by `id` when present, else exact (verb, args))
-) -> bool:  # True if appended, False if skipped as a duplicate
-    """Append one op record — the envelope-agnostic core `append_write` wraps.
+) -> Optional[AppendedRecord]:  # The record and where it landed, or None if skipped as a duplicate
+    """Append one op record and say where it landed — the core `append_op` answers True / False for.
 
     Stamps `ts` from the op clock (an open window's ts, so the op carries the time its db
     write already used) and `session` from CJM_SESSION, only when ABSENT, so a domain
@@ -125,17 +138,19 @@ def append_op(
     through verbatim. Dedup prefers an explicit op `id` (exact-once semantics for
     envelope ops) and falls back to the exact (verb, args) match. `dedup=False`
     is the bulk path (genesis imports): a full journal rescan per append is
-    O(n^2) at import scale — bulk writers dedup upstream or not at all."""
+    O(n^2) at import scale — bulk writers dedup upstream or not at all. The landing
+    (segment index, byte offset, line digest) is what a writer's applied cursor records; a
+    post-append rotation renames the tail to that same index, so it stays true."""
     if not op.get("verb"):
         raise ValueError("append_op: op requires a `verb`")
     if dedup:
         oid = op.get("id")
         for existing in read_journal(path):
             if oid is not None and existing.get("id") == oid:
-                return False
+                return None
             if (oid is None and "id" not in existing
                     and existing.get("verb") == op["verb"] and existing.get("args") == op.get("args")):
-                return False  # the exact-match lane is id-less records only — envelope ops never shadow it
+                return None  # the exact-match lane is id-less records only — envelope ops never shadow it
     record = dict(op)
     record.setdefault("ts", op_now())
     session = current_session()
@@ -143,12 +158,25 @@ def append_op(
         record["session"] = session
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(record, sort_keys=True) + "\n"
-    with p.open("a") as f:
+    line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+    segment = live_index(path)
+    with p.open("ab") as f:
         f.write(line)
-    record_append(path, len(line.encode("utf-8")))  # the instrument's logical bytes (2f5033bf (1))
+        offset = f.tell()
+    record_append(path, len(line))  # the instrument's logical bytes (2f5033bf (1))
     maybe_rotate(path)  # post-append: a fat op lands, then closes its segment
-    return True
+    return AppendedRecord(record=record, segment=segment, offset=offset,
+                          digest=hashlib.sha256(line).hexdigest())
+
+
+def append_op(
+    path: str,           # Journal file path (JSONL)
+    op: Dict[str, Any],  # The full op record — requires `verb`; envelope fields ride verbatim
+    dedup: bool = True,  # Skip an already-journaled duplicate (by `id` when present, else exact (verb, args))
+) -> bool:  # True if appended, False if skipped as a duplicate
+    """Append one op record — the envelope-agnostic core `append_write` wraps; `append_record`
+    carries the contract (stamping, dedup, rotation) and says where the record landed."""
+    return append_record(path, op, dedup=dedup) is not None
 
 
 def _stem_suffix(
@@ -157,6 +185,42 @@ def _stem_suffix(
     """Split a journal filename for segment naming: cold segments interpose the
     rotation index between stem and suffix (`<stem>.NNNN.jsonl`)."""
     return (name[: -len(".jsonl")], ".jsonl") if name.endswith(".jsonl") else (name, "")
+
+
+def _cold_segments(
+    path: str,  # The live journal path — the family's tail
+) -> Dict[int, Path]:  # Cold index -> its segment (the plain form wins its index)
+    """The family's cold segments by rotation index, plain or compressed: the one glob behind
+    `journal_segments`, `indexed_segments`, `live_index` and `rotate_journal`."""
+    p = Path(path)
+    stem, suffix = _stem_suffix(p.name)
+    by_index: Dict[int, Path] = {}
+    for pattern in (f"{stem}.[0-9][0-9][0-9][0-9]{suffix}.xz",
+                    f"{stem}.[0-9][0-9][0-9][0-9]{suffix}"):
+        for q in p.parent.glob(pattern):          # plain globbed second: it wins its index
+            if q.is_file():
+                by_index[int(q.name[len(stem) + 1:len(stem) + 5])] = q
+    return by_index
+
+
+def indexed_segments(
+    path: str,  # The live journal path — the family's tail
+) -> List[Tuple[int, str]]:  # (family index, segment path): cold segments in rotation order, then the live tail
+    """The SEGMENT FAMILY with each segment's index: a cold segment by its NNNN, the live tail at
+    `live_index` (one past the highest cold index). A position in the family -- (index, byte
+    offset) -- is stable across rotation, because the tail closes into exactly its index with its
+    bytes unchanged (design detail 65f4a6c9 (2c))."""
+    cold = _cold_segments(path)
+    p = Path(path)
+    tail = [(max(cold, default=0) + 1, str(p))] if p.exists() else []
+    return [(k, str(cold[k])) for k in sorted(cold)] + tail
+
+
+def live_index(
+    path: str,  # The live journal path — the family's tail
+) -> int:  # The family index the live tail holds: the index its rotation will mint
+    """The live tail's place in its family: one past the highest cold index, plain or compressed."""
+    return max(_cold_segments(path), default=0) + 1
 
 
 def journal_segments(
@@ -174,16 +238,7 @@ def journal_segments(
     index either way; when both forms exist (a swap that crashed before its unlink)
     the PLAIN one is listed, the original, until `compress_cold_segments` finishes it.
     Read a listed segment with `read_segment`, never `Path.read_text`."""
-    p = Path(path)
-    stem, suffix = _stem_suffix(p.name)
-    by_index: Dict[str, Path] = {}
-    for pattern in (f"{stem}.[0-9][0-9][0-9][0-9]{suffix}.xz",
-                    f"{stem}.[0-9][0-9][0-9][0-9]{suffix}"):
-        for q in p.parent.glob(pattern):          # plain globbed second: it wins its index
-            if q.is_file():
-                by_index[q.name[len(stem) + 1:len(stem) + 5]] = q
-    cold = [by_index[k] for k in sorted(by_index)]
-    return [str(q) for q in cold] + ([str(p)] if p.exists() else [])
+    return [seg for _, seg in indexed_segments(path)]
 
 
 def read_segment(
@@ -237,11 +292,7 @@ def rotate_journal(
     if not p.exists() or p.stat().st_size == 0:
         return None
     stem, suffix = _stem_suffix(p.name)
-    taken = (int(q.name[len(stem) + 1:len(stem) + 5])
-             for pattern in (f"{stem}.[0-9][0-9][0-9][0-9]{suffix}",
-                             f"{stem}.[0-9][0-9][0-9][0-9]{suffix}.xz")
-             for q in p.parent.glob(pattern))
-    cold = p.with_name(f"{stem}.{max(taken, default=0) + 1:04d}{suffix}")
+    cold = p.with_name(f"{stem}.{live_index(path):04d}{suffix}")
     p.rename(cold)
     return compress_segment(str(cold)) if compress else str(cold)
 

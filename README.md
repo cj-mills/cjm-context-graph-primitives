@@ -14,6 +14,7 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 - **`cjm_context_graph_primitives.query`** — The structured typed query expression (pass-2 Thread 5) - DATA nouns describing graph reads. Execution lives in graph-storage adapters (stage 4 translates expressions per-backend); this library only defines, validates, and (de)serializes them. Typed expressions are the primary, portable surface - no storage-schema leak (the raw-SQL nodes/edges + json_extract coupling of ledger C2/C3), and scale-shaped (server-side filter/page/count answering D13). RawQuery is the explicitly-marked, backend-coupled escape hatch: recurring raw patterns EXPOSE missing typed-expression capabilities.
 - **`cjm_context_graph_primitives.slices`** — Atomic typed content slices - WHAT REGION of the located resource a reference consumes. The slice KIND selects the content facet on multi-facet nodes (TimeSlice -> audio, CharSlice -> text), which dissolves the chunk-local-vs-source-coordinate ambiguity without a frame field (pass-2 Thread 2).
 - **`cjm_context_graph_primitives.timings`** — THE INSTRUMENT's collector: phase spans and the storage door's accumulator for ONE run.
+- **`cjm_context_graph_primitives.writer`** — THE WRITE ORDER: plan -> append -> apply -> advance, one writer per journal family.
 
 ## API
 
@@ -25,12 +26,16 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 
 ### `cjm_context_graph_primitives.journal`
 
-- `append_op` _function_ — Append one op record — the envelope-agnostic core `append_write` wraps.
+- `AppendedRecord` _class_ — One record `append_record` landed, and where: a writer advances its applied cursor to it
+- `append_op` _function_ — Append one op record — the envelope-agnostic core `append_write` wraps; `append_record`
+- `append_record` _function_ — Append one op record and say where it landed — the core `append_op` answers True / False for.
 - `append_write` _function_ — Append one write op (skipping an exact (verb,args) duplicate).
 - `compress_cold_segments` _function_ — Compress every PLAIN cold segment of a family (the live tail is never touched).
 - `compress_segment` _function_ — Store one cold segment xz-compressed, proven lossless before the plain copy goes.
 - `current_session` _function_ — The session key stamped on journal appends (provenance, not replay input).
+- `indexed_segments` _function_ — The SEGMENT FAMILY with each segment's index: a cold segment by its NNNN, the live tail at
 - `journal_segments` _function_ — The journal's SEGMENT FAMILY: rotated cold segments + the live tail.
+- `live_index` _function_ — The live tail's place in its family: one past the highest cold index, plain or compressed.
 - `maybe_rotate` _function_ — Rotate the live tail once it reaches the budget (the POST-append check).
 - `op_clock` _function_ — Open one op's clock window: reuse an open one (replay, or an enclosing write unit),
 - `op_clocked` _function_ — Decorator form of `op_clock` for a write entry point (sync or async): every db write
@@ -95,6 +100,21 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 - `span` _function_ — Measure one phase of the armed run (a no-op yielding a scratch dict when none is). A
 - `timed` _function_ — Decorator form of `span` for a function (sync or async): each call is one phase.
 - `timings_path` _function_ — The timings ledger beside a db (`dev-graph.db` -> `dev-graph.timings.jsonl`).
+
+### `cjm_context_graph_primitives.writer`
+
+- `CursorMismatch` _class_ — The family under a cursor is not the one it applied -- rewritten (compaction) or paired
+- `CursorStore` _class_ — Where a db keeps its applied cursors: beside the graph, one per journal family.
+- `JournalPosition` _class_ — How far into a journal family a db has applied: the segment holding the last applied
+- `JournalWriter` _class_ — One writer's unit of work on one journal family (65f4a6c9): `async with` takes the
+- `NoCursor` _class_ — The db holds no applied cursor for the family: it predates the cursor or was built without
+- `family_lock` _function_ — The family's exclusive writer lock: an flock on its own open of the lock file, so it
+- `family_name` _function_ — A family is keyed by its live tail's FILE NAME, never its path: a db and its journals move
+- `fault_point` _function_ — A crash-injection point on the write path: the in-process hook, then the armed env.
+- `journal_lag` _function_ — How far a db trails its journal, for a READER to report (65f4a6c9 (2d)): readers never
+- `lock_path` _function_
+- `read_tail` _function_ — Every record of the family past `position`, in append order -- only the tail is read (the
+- `stamp_cursor` _function_ — Record the family's END as the db's cursor -- for a db that holds the whole family: a
 
 ## Dependencies
 
