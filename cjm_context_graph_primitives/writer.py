@@ -34,7 +34,9 @@ from cjm_context_graph_primitives.journal import (append_record, APPLIED_FIRST, 
 
 # THE CRASH POINTS (the proof of 65f4a6c9): a test sets FAULT_HOOK (it raises, simulating the
 # crash in-process); a proof arms CJM_JOURNAL_FAULT=<point> in a child process, which then dies
-# right there with no cleanup -- a real crash, its lock released by the OS.
+# right there with no cleanup -- a real crash, its lock released by the OS. <point>@<n> dies at
+# the process's n-th arrival there instead of its first, so a chain of writes in one invocation
+# can be crashed at every op boundary (ruling 547f4123 (1)).
 JOURNAL_FAULT_ENV = "CJM_JOURNAL_FAULT"
 FAULT_EXIT = 86  # The exit code an armed crash point dies with
 FAULT_POINTS = ("after_append", "after_apply")
@@ -44,15 +46,21 @@ FAULT_HOOK: ContextVar[Optional[Callable[[str], None]]] = ContextVar("journal_fa
 # the unit of work instead of waiting on itself.
 _HELD: ContextVar[frozenset] = ContextVar("journal_families_held", default=frozenset())
 
+_ARRIVALS: Dict[str, int] = {}  # This process's arrivals per crash point (the armed <point>@<n> counts them)
+
 
 def fault_point(
-    point: str,  # One of FAULT_POINTS
+    point: str,  # One of FAULT_POINTS (armed as <point> or <point>@<n>)
 ) -> None:
     """A crash-injection point on the write path: the in-process hook, then the armed env."""
     hook = FAULT_HOOK.get()
     if hook is not None:
         hook(point)
-    if os.environ.get(JOURNAL_FAULT_ENV) == point:
+    armed, _, nth = (os.environ.get(JOURNAL_FAULT_ENV) or "").partition("@")
+    if armed != point:
+        return
+    _ARRIVALS[point] = _ARRIVALS.get(point, 0) + 1
+    if _ARRIVALS[point] == int(nth or 1):
         os._exit(FAULT_EXIT)
 
 

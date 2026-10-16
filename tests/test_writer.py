@@ -270,6 +270,21 @@ def test_a_killed_writer_releases_the_lock_and_the_next_process_heals(tmp_path):
     assert _applied(tmp_path) == ["x-0"]
 
 
+def test_an_armed_nth_arrival_crashes_the_nth_write_of_the_process(tmp_path):
+    j, cursors = str(tmp_path / "w.jsonl"), FileCursors(tmp_path / "cursors.json")
+    asyncio.run(stamp_cursor(j, cursors))
+    child = _spawn(tmp_path, 3, "x", fault="after_append@2")
+    assert child.wait(30) == FAULT_EXIT
+    assert [r["id"] for r in read_journal(j)] == ["x-0", "x-1"] and _applied(tmp_path) == ["x-0"]
+
+    async def heal():
+        async with JournalWriter(j, cursors, lambda r: _file_apply(str(tmp_path / "db.log"), r)) as w:
+            return w.healed
+
+    assert asyncio.run(asyncio.wait_for(heal(), 5)) == 1  # only the crashed write's record was behind
+    assert _applied(tmp_path) == ["x-0", "x-1"]
+
+
 def test_concurrent_processes_apply_in_journal_order(tmp_path):
     j, cursors = str(tmp_path / "w.jsonl"), FileCursors(tmp_path / "cursors.json")
     asyncio.run(stamp_cursor(j, cursors))
