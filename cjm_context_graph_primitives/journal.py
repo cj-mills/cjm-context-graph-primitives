@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple
 
 from cjm_context_graph_primitives.timings import record_append, span, timed
 
@@ -87,15 +87,101 @@ def op_clocked(fn):  # The function, run inside one op clock window per call
     return run
 
 
+# THE ATOMIC UNIT (ruling 3de795e4): a human gesture's ops land as ONE unit -- appended together
+# in one write, each record tagged with the unit's id and its record count, applied only once the
+# whole unit is appended. A unit a crash tore mid-append can stand only at the live tail's END
+# (every appender of a write family holds its lock, and the next holder seals a torn end away),
+# so readers stop at the COMMITTED end and a torn unit is never applied, live or on rebuild. A
+# compaction may later archive a unit's record whole; nothing reads a unit's count but the tail's.
+# A single-op unit is an ordinary record (no tags).
+UNIT = "unit"            # The unit id each record of a multi-op unit carries
+UNIT_SIZE = "unit_size"  # How many records that unit holds
+
+
+def committed_length(
+    path: str,  # The family's live journal path
+) -> int:  # Byte length of its committed prefix (the whole file when nothing is torn)
+    """How much of the live tail is COMMITTED (ruling 3de795e4): everything but a partial last line
+    (an append torn mid-write) and a trailing unit holding fewer records than its size. Read
+    backwards from the end, a few KB at a time -- never the whole tail."""
+    try:
+        size = os.path.getsize(path)
+    except FileNotFoundError:
+        return 0
+    back = 4096
+    with open(path, "rb") as f:
+        while True:
+            start = max(0, size - back)
+            f.seek(start)
+            data = f.read(size - start)
+            if start and b"\n" not in data[:-1]:
+                back *= 2  # not one whole line in the window yet
+                continue
+            begin = data.find(b"\n") + 1 if start else 0  # the window's first line may start before it
+            lines: List[Tuple[int, bytes]] = []  # (offset just past the line, line): complete lines only
+            at = start + begin
+            for line in data[begin:].splitlines(keepends=True):
+                at += len(line)
+                if line.endswith(b"\n"):
+                    lines.append((at, line))
+            records = [(end, line) for end, line in lines if line.strip()]
+            if not records:
+                if not start:
+                    return lines[-1][0] if lines else 0
+                back *= 2
+                continue
+            last = json.loads(records[-1][1])
+            uid = last.get(UNIT)
+            if uid is None:
+                return lines[-1][0]
+            held = 0
+            for _, line in reversed(records):
+                if json.loads(line).get(UNIT) != uid:
+                    break
+                held += 1
+            if held >= int(last.get(UNIT_SIZE) or 1):
+                return lines[-1][0]
+            if held < len(records) or not start:  # the torn unit's first record is in the window
+                end, line = records[len(records) - held]
+                return end - len(line)
+            back *= 2
+
+
+def seal_tail(
+    path: str,  # The family's live journal path -- its lock HELD by the caller
+) -> int:  # Bytes cut off the tail (0 when nothing was torn)
+    """Cut an uncommitted end off the live tail (ruling 3de795e4): a partial last line and a
+    trailing torn unit, which no apply ever followed, so no cursor stands past the cut. Only a
+    holder of the family's lock seals -- a writer as it opens, a rotation before it renames -- and
+    every appender of a write family holds that lock, so what it finds torn a crash tore."""
+    keep = committed_length(path)
+    try:
+        size = os.path.getsize(path)
+    except FileNotFoundError:
+        return 0
+    if keep >= size:
+        return 0
+    with open(path, "r+b") as f:
+        f.truncate(keep)
+        f.flush()
+        os.fsync(f.fileno())
+    return size - keep
+
+
 def read_journal(
     path: str,  # Journal file path (JSONL)
 ) -> List[Dict[str, Any]]:  # The recorded ops, in append order
     """Read every journaled write op across the SEGMENT FAMILY (one JSON object per
-    line; missing files = []) — cold segments first, live tail last: append order."""
+    line; missing files = []) — cold segments first, live tail last: append order. The live
+    tail is read to its COMMITTED end (`committed_length`): a torn unit is never returned."""
     ops: List[Dict[str, Any]] = []
+    tail = str(Path(path))
     with span("read_journal") as measured:  # the instrument (681604c1): a whole-history read
         for seg in journal_segments(path):
-            text = read_segment(seg)
+            if seg == tail:
+                text = Path(seg).read_bytes()[:committed_length(seg)].decode("utf-8")
+            else:
+                text = read_segment(seg)
             measured["bytes"] = measured.get("bytes", 0) + len(text)
             for line in text.splitlines():
                 line = line.strip()
@@ -140,6 +226,37 @@ class AppendedRecord:
     digest: str             # sha256 of its line, newline included
 
 
+def stamp_record(
+    op: Dict[str, Any],  # The full op record — requires `verb`; envelope fields ride verbatim
+) -> Dict[str, Any]:  # The record as it is journaled: `ts` from the op clock, `session` from CJM_SESSION
+    """Stamp an op for the journal, each field only when ABSENT -- at its append, or as a unit
+    buffers it (ruling 3de795e4), so a buffered op carries the time its plan ran."""
+    if not op.get("verb"):
+        raise ValueError("append_op: op requires a `verb`")
+    record = dict(op)
+    record.setdefault("ts", op_now())
+    session = current_session()
+    if session and "session" not in record:
+        record["session"] = session
+    return record
+
+
+def journaled(
+    path: str,           # Journal file path (JSONL)
+    op: Dict[str, Any],  # An op about to be appended
+) -> bool:  # True when the family already holds it (by `id` when present, else exact (verb, args))
+    """The append dedup rule: an explicit op `id` is exact-once; an id-less op matches an id-less
+    record of the same (verb, args) -- envelope ops never shadow that lane."""
+    oid = op.get("id")
+    for existing in read_journal(path):
+        if oid is not None and existing.get("id") == oid:
+            return True
+        if (oid is None and "id" not in existing
+                and existing.get("verb") == op.get("verb") and existing.get("args") == op.get("args")):
+            return True
+    return False
+
+
 @timed("append_op")
 def append_record(
     path: str,           # Journal file path (JSONL)
@@ -157,21 +274,9 @@ def append_record(
     O(n^2) at import scale — bulk writers dedup upstream or not at all. The landing
     (segment index, byte offset, line digest) is what a writer's applied cursor records; a
     post-append rotation renames the tail to that same index, so it stays true."""
-    if not op.get("verb"):
-        raise ValueError("append_op: op requires a `verb`")
-    if dedup:
-        oid = op.get("id")
-        for existing in read_journal(path):
-            if oid is not None and existing.get("id") == oid:
-                return None
-            if (oid is None and "id" not in existing
-                    and existing.get("verb") == op["verb"] and existing.get("args") == op.get("args")):
-                return None  # the exact-match lane is id-less records only — envelope ops never shadow it
-    record = dict(op)
-    record.setdefault("ts", op_now())
-    session = current_session()
-    if session and "session" not in record:
-        record["session"] = session
+    if dedup and journaled(path, op):
+        return None
+    record = stamp_record(op)
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
@@ -183,6 +288,43 @@ def append_record(
     maybe_rotate(path)  # post-append: a fat op lands, then closes its segment
     return AppendedRecord(record=record, segment=segment, offset=offset,
                           digest=hashlib.sha256(line).hexdigest())
+
+
+@timed("append_op")
+def append_records(
+    path: str,                   # Journal file path (JSONL)
+    records: List[Dict[str, Any]],  # Stamped records (`stamp_record`), a unit's tags on each
+    tear: Optional[Callable[[], None]] = None,  # The crash proof's seam: called between a torn prefix and the rest
+) -> List[AppendedRecord]:  # Each record and where it landed, in order
+    """Append an atomic unit's records in ONE write (ruling 3de795e4) and say where each landed. No
+    dedup: a unit is planned whole, and a no-change write is caught at its plan (17daa86b). The
+    post-append rotation runs once, after the whole unit, so a unit never spans two segments.
+    With `tear` (a crash proof only), the write is split mid-way through the second record and
+    `tear` runs between -- the torn append a crash can leave."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lines = [(json.dumps(r, sort_keys=True) + "\n").encode("utf-8") for r in records]
+    data = b"".join(lines)
+    segment = live_index(path)
+    with p.open("ab") as f:
+        if tear is not None and len(lines) > 1:
+            cut = len(lines[0]) + len(lines[1]) // 2
+            f.write(data[:cut])
+            f.flush()
+            tear()
+            f.write(data[cut:])
+        else:
+            f.write(data)
+        end = f.tell()
+    record_append(path, len(data))  # the instrument's logical bytes (2f5033bf (1))
+    landed: List[AppendedRecord] = []
+    offset = end - len(data)
+    for record, line in zip(records, lines):
+        offset += len(line)
+        landed.append(AppendedRecord(record=record, segment=segment, offset=offset,
+                                     digest=hashlib.sha256(line).hexdigest()))
+    maybe_rotate(path)  # post-append, once: the whole unit lands, then closes its segment
+    return landed
 
 
 def append_op(
@@ -312,6 +454,7 @@ def rotate_journal(
     with family_lock_sync(path, wait=wait) as held:
         if held is None:
             return None
+        seal_tail(path)  # a torn unit never closes into a cold segment (ruling 3de795e4)
         p = Path(path)
         if not p.exists() or p.stat().st_size == 0:
             return None

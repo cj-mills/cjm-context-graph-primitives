@@ -21,13 +21,17 @@ import hashlib
 import json
 import lzma
 import os
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple
+from uuid import uuid4
 
-from cjm_context_graph_primitives.journal import (append_record, APPLIED_FIRST, family_lock,
-                                                  indexed_segments, PROVENANCE_TS)
+from cjm_context_graph_primitives.journal import (append_record, append_records, APPLIED_FIRST,
+                                                  committed_length, family_lock, indexed_segments,
+                                                  journaled, PROVENANCE_TS, seal_tail,
+                                                  stamp_record, UNIT, UNIT_SIZE)
 
 # THE CRASH POINTS (the proof of 65f4a6c9): a test sets FAULT_HOOK (it raises, simulating the
 # crash in-process); a proof arms CJM_JOURNAL_FAULT=<point> in a child process, which then dies
@@ -36,7 +40,7 @@ from cjm_context_graph_primitives.journal import (append_record, APPLIED_FIRST, 
 # can be crashed at every op boundary (ruling 547f4123 (1)).
 JOURNAL_FAULT_ENV = "CJM_JOURNAL_FAULT"
 FAULT_EXIT = 86  # The exit code an armed crash point dies with
-FAULT_POINTS = ("after_append", "after_apply")
+FAULT_POINTS = ("torn_append", "after_append", "after_apply")  # torn_append: a unit's write split mid-way (ruling 3de795e4)
 FAULT_HOOK: ContextVar[Optional[Callable[[str], None]]] = ContextVar("journal_fault_hook", default=None)
 
 # The writers this context's enclosing blocks have open, by family (its live tail's real path): a
@@ -60,6 +64,15 @@ def fault_point(
     _ARRIVALS[point] = _ARRIVALS.get(point, 0) + 1
     if _ARRIVALS[point] == int(nth or 1):
         os._exit(FAULT_EXIT)
+
+
+def fault_armed(
+    point: str,  # One of FAULT_POINTS
+) -> bool:  # True when a crash may be injected there (a hook is set, or the env arms that point)
+    """Whether a proof may crash at `point` -- so the write path takes a fault's shape (a torn
+    append's split write) only under a proof, never in production."""
+    return (FAULT_HOOK.get() is not None
+            or (os.environ.get(JOURNAL_FAULT_ENV) or "").partition("@")[0] == point)
 
 
 @dataclass(frozen=True)
@@ -162,9 +175,11 @@ def read_tail(
     position: JournalPosition, # How far a db has applied
 ) -> List[Tuple[Dict[str, Any], JournalPosition]]:  # Each record past it, with the position just past that record
     """Every record of the family past `position`, in append order -- only the tail is read (the
-    cursor's segment from its offset, then each later segment). The position is CHECKED first:
-    the record ending at it must carry its digest, else CursorMismatch."""
+    cursor's segment from its offset, then each later segment), and the live tail only to its
+    COMMITTED end (a torn unit is never returned: ruling 3de795e4). The position is CHECKED
+    first: the record ending at it must carry its digest, else CursorMismatch."""
     segs = indexed_segments(path)
+    live = str(Path(path))
     if position.ordinal:
         held = dict(segs).get(position.segment)
         if held is None or _digest(_line_ending_at(held, position.offset)) != position.digest:
@@ -178,7 +193,10 @@ def read_tail(
         if index < position.segment:
             continue
         at = position.offset if index == position.segment else 0
-        for line in _segment_bytes(seg, at).splitlines(keepends=True):
+        data = _segment_bytes(seg, at)
+        if seg == live:
+            data = data[:max(0, committed_length(seg) - at)]
+        for line in data.splitlines(keepends=True):
             at += len(line)
             if not line.strip():
                 continue
@@ -209,6 +227,8 @@ class JournalWriter:
         self.position: Optional[JournalPosition] = None  # The db's applied cursor while the block runs
         self.healed = 0                                   # Records the entry's heal applied
         self._joined: Optional["JournalWriter"] = None    # The outer writer this block joined
+        self._unit: Optional[List[Dict[str, Any]]] = None # The open unit's buffered records (ruling 3de795e4)
+        self.sealed = 0                                   # Bytes of a torn end the entry cut off
 
     async def __aenter__(self) -> "JournalWriter":
         key = os.path.realpath(self.path)
@@ -223,6 +243,7 @@ class JournalWriter:
         self._lock = family_lock(self.path)
         await self._lock.__aenter__()
         try:
+            self.sealed = seal_tail(self.path)  # a crash's torn unit, never applied: cut before the heal
             self.healed = await self._heal()
         except BaseException as e:
             await self._lock.__aexit__(type(e), e, e.__traceback__)
@@ -275,24 +296,84 @@ class JournalWriter:
         await self.cursors.record(self.family, position)
         self.position = position
 
-    async def write(
-        self,
-        op: Dict[str, Any],  # A PLANNED op: references resolved to ids, minted ids in it, validated
-        dedup: bool = True,  # Skip an already-journaled duplicate (append_op's rule)
-    ) -> Optional[Dict[str, Any]]:  # The record as journaled, or None when dedup found it journaled (and so applied)
-        """Append, apply, advance. A planned op is total, so its apply cannot refuse; a crash
-        after the append leaves a record the next writer's heal applies."""
+    @asynccontextmanager
+    async def unit(self) -> AsyncIterator["JournalWriter"]:  # This writer, its writes buffered
+        """An ATOMIC UNIT (ruling 3de795e4): every `write` inside is planned and buffered -- never
+        appended, never applied -- and at the block's close the unit's records are APPENDED in one
+        write (each tagged with the unit's id and its size), then APPLIED in order, the cursor
+        advanced past each. A crash yields the whole unit or none of it: a unit torn mid-append is
+        never read, and the next writer seals it off. A plan inside reads the db as it stood when
+        the unit opened. A unit inside a unit joins it; an exception discards the unit (nothing
+        journaled, nothing applied); an empty unit appends nothing; a one-op unit is an ordinary
+        record."""
         if self.position is None:
-            raise RuntimeError("JournalWriter.write outside its `async with` block")
-        landed = append_record(self.path, op, dedup=dedup)
-        if landed is None:
-            return None
+            raise RuntimeError("JournalWriter.unit outside its `async with` block")
+        if self._unit is not None:
+            yield self
+            return
+        self._unit = []
+        try:
+            yield self
+        except BaseException:
+            self._unit = None
+            raise
+        records, self._unit = self._unit, None
+        await self._land(records)
+
+    async def _land(
+        self,
+        records: List[Dict[str, Any]],  # A closed unit's stamped records, in plan order
+    ) -> None:
+        if not records:
+            return
+        if len(records) == 1:
+            await self._commit(append_record(self.path, records[0], dedup=False))
+            return
+        uid, size = str(uuid4()), len(records)
+        tagged = [{**r, UNIT: uid, UNIT_SIZE: size} for r in records]
+        tear = (lambda: fault_point("torn_append")) if fault_armed("torn_append") else None
+        landed = append_records(self.path, tagged, tear=tear)
+        fault_point("after_append")
+        for one in landed:
+            await self._apply(one.record)
+            fault_point("after_apply")
+            await self._advance(JournalPosition(one.segment, one.offset,
+                                                self.position.ordinal + 1, one.digest))
+
+    async def _commit(
+        self,
+        landed: Any,  # The AppendedRecord one append landed
+    ) -> Dict[str, Any]:  # The record as journaled
         fault_point("after_append")
         await self._apply(landed.record)
         fault_point("after_apply")
         await self._advance(JournalPosition(landed.segment, landed.offset,
                                             self.position.ordinal + 1, landed.digest))
         return landed.record
+
+    async def write(
+        self,
+        op: Dict[str, Any],  # A PLANNED op: references resolved to ids, minted ids in it, validated
+        dedup: bool = True,  # Skip an already-journaled duplicate (append_op's rule)
+    ) -> Optional[Dict[str, Any]]:  # The record as journaled (buffered, inside a unit), or None when dedup found it journaled
+        """Append, apply, advance. A planned op is total, so its apply cannot refuse; a crash
+        after the append leaves a record the next writer's heal applies. Inside a `unit` the op
+        is stamped and buffered instead; the unit's close appends and applies it."""
+        if self.position is None:
+            raise RuntimeError("JournalWriter.write outside its `async with` block")
+        if self._unit is not None:
+            if dedup and (journaled(self.path, op) or any(
+                    (op.get("id") is not None and r.get("id") == op.get("id"))
+                    or (op.get("id") is None and "id" not in r and r.get("verb") == op.get("verb")
+                        and r.get("args") == op.get("args")) for r in self._unit)):
+                return None
+            record = stamp_record(op)
+            self._unit.append(record)
+            return record
+        landed = append_record(self.path, op, dedup=dedup)
+        if landed is None:
+            return None
+        return await self._commit(landed)
 
     async def restamp(self) -> JournalPosition:  # The family's end, now the db's cursor
         """Re-stamp the cursor at the family's END after a rewrite under this writer's lock moved

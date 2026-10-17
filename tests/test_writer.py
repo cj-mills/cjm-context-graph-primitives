@@ -9,7 +9,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from cjm_context_graph_primitives.journal import read_journal, rotate_journal
+from cjm_context_graph_primitives.journal import (committed_length, read_journal, rotate_journal, UNIT,
+                                                  UNIT_SIZE)
 from cjm_context_graph_primitives.writer import (CursorMismatch, FAULT_EXIT, FAULT_HOOK,
                                                  JOURNAL_FAULT_ENV, journal_lag, JournalPosition,
                                                  JournalWriter, NoCursor, ORIGIN, read_tail,
@@ -364,3 +365,191 @@ def test_concurrent_processes_apply_in_journal_order(tmp_path):
     assert len(ids) == 50 and _applied(tmp_path) == ids
     end = asyncio.run(cursors.read("w.jsonl"))
     assert end.ordinal == 50 and read_tail(j, end) == []
+
+
+# -- the atomic unit (ruling 3de795e4): a gesture's ops land whole or not at all ------------
+
+async def write_unit(j, cursors, db, ops):
+    async with JournalWriter(j, cursors, db.apply) as w:
+        async with w.unit():
+            for op in ops:
+                await w.write(op, dedup=False)
+
+
+def test_a_unit_appends_whole_at_its_close_then_applies_in_order(tmp_path):
+    j, cursors, db = str(tmp_path / "w.jsonl"), MemCursors(), MemDb()
+    asyncio.run(stamp_cursor(j, cursors))
+
+    async def run():
+        async with JournalWriter(j, cursors, db.apply) as w:
+            async with w.unit():
+                for i in range(3):
+                    await w.write(put(i), dedup=False)
+                    assert read_journal(j) == [] and db.log == []  # buffered: a plan reads the db as the unit opened
+            return w
+
+    asyncio.run(run())
+    recs = read_journal(j)
+    assert [r["id"] for r in recs] == db.log == ["op-0", "op-1", "op-2"]
+    assert len({r[UNIT] for r in recs}) == 1 and {r[UNIT_SIZE] for r in recs} == {3}
+    end = cursors.held["w.jsonl"]
+    assert end.ordinal == 3 and end.offset == os.path.getsize(j)
+
+
+def test_a_one_op_unit_is_an_ordinary_record_and_an_empty_one_appends_nothing(tmp_path):
+    j, cursors, db = str(tmp_path / "w.jsonl"), MemCursors(), MemDb()
+    asyncio.run(stamp_cursor(j, cursors))
+    asyncio.run(write_unit(j, cursors, db, []))
+    assert not Path(j).exists() or read_journal(j) == []
+    asyncio.run(write_unit(j, cursors, db, [put(0)]))
+    (rec,) = read_journal(j)
+    assert UNIT not in rec and db.log == ["op-0"]
+
+
+def test_an_exception_discards_the_unit_and_a_nested_unit_joins(tmp_path):
+    j, cursors, db = str(tmp_path / "w.jsonl"), MemCursors(), MemDb()
+    asyncio.run(stamp_cursor(j, cursors))
+
+    async def failing():
+        async with JournalWriter(j, cursors, db.apply) as w:
+            async with w.unit():
+                await w.write(put(0), dedup=False)
+                raise ValueError("the gesture failed")
+
+    with pytest.raises(ValueError):
+        asyncio.run(failing())
+    assert (not Path(j).exists() or read_journal(j) == []) and db.log == []
+
+    async def nested():
+        async with JournalWriter(j, cursors, db.apply) as w:
+            async with w.unit():
+                await w.write(put(1), dedup=False)
+                async with JournalWriter(j, cursors, db.apply) as inner:  # a core's own window joins
+                    async with inner.unit():
+                        await inner.write(put(2), dedup=False)
+                assert db.log == []  # the inner close lands nothing: one unit per gesture
+
+    asyncio.run(nested())
+    recs = read_journal(j)
+    assert [r["id"] for r in recs] == db.log == ["op-1", "op-2"] and len({r[UNIT] for r in recs}) == 1
+
+
+def test_a_unit_dedups_against_the_journal_and_its_own_buffer(tmp_path):
+    j, cursors, db = str(tmp_path / "w.jsonl"), MemCursors(), MemDb()
+    asyncio.run(stamp_cursor(j, cursors))
+    asyncio.run(write_all(j, cursors, db, [put(0)]))
+
+    async def run():
+        async with JournalWriter(j, cursors, db.apply) as w:
+            async with w.unit():
+                assert await w.write(put(0)) is None
+                assert await w.write(put(1)) is not None
+                assert await w.write(put(1)) is None
+
+    asyncio.run(run())
+    assert [r["id"] for r in read_journal(j)] == ["op-0", "op-1"]
+
+
+@pytest.mark.parametrize("point,n", [("torn_append", 1), ("after_append", 1),
+                                     ("after_apply", 1), ("after_apply", 2), ("after_apply", 3)])
+def test_a_crashed_unit_lands_whole_or_not_at_all(tmp_path, point, n):
+    clean_j, clean_c, clean_db = str(tmp_path / "clean" / "w.jsonl"), MemCursors(), MemDb()
+    asyncio.run(stamp_cursor(clean_j, clean_c))
+    asyncio.run(write_all(clean_j, clean_c, clean_db, [put(0)]))
+    asyncio.run(write_unit(clean_j, clean_c, clean_db, [put(i) for i in (1, 2, 3)]))
+
+    j, cursors, db = str(tmp_path / "w.jsonl"), MemCursors(), MemDb()
+    asyncio.run(stamp_cursor(j, cursors))
+    asyncio.run(write_all(j, cursors, db, [put(0)]))
+    arrivals = []
+
+    def hook(p):
+        if p == point:
+            arrivals.append(p)
+            if len(arrivals) == n:
+                raise Crash(p)
+
+    token = FAULT_HOOK.set(hook)
+    try:
+        with pytest.raises(Crash):
+            asyncio.run(write_unit(j, cursors, db, [put(i) for i in (1, 2, 3)]))
+    finally:
+        FAULT_HOOK.reset(token)
+    if point == "torn_append":  # a torn unit: never read, never applied, and the next writer seals it
+        assert os.path.getsize(j) > committed_length(j)
+        assert [r["id"] for r in read_journal(j)] == ["op-0"] and db.log == ["op-0"]
+
+        async def seal():
+            async with JournalWriter(j, cursors, db.apply) as w:
+                return w.sealed, w.healed
+
+        sealed, healed = asyncio.run(seal())
+        assert sealed > 0 and healed == 0 and os.path.getsize(j) == committed_length(j)
+        assert [r["id"] for r in read_journal(j)] == db.log == ["op-0"]
+        return
+    async def heal():
+        async with JournalWriter(j, cursors, db.apply) as w:
+            return w.healed
+
+    assert asyncio.run(heal()) == (3 if point == "after_append" else 3 - n + 1)
+    assert db.rows == clean_db.rows
+    strip = lambda rs: [{k: v for k, v in r.items() if k not in ("ts", UNIT)} for r in rs]
+    assert strip(read_journal(j)) == strip(read_journal(clean_j))
+    assert cursors.held["w.jsonl"].ordinal == clean_c.held["w.jsonl"].ordinal == 4
+
+
+def test_the_committed_end_reads_backwards_past_big_records_and_a_rotation_seals(tmp_path):
+    j, cursors, db = str(tmp_path / "w.jsonl"), MemCursors(), MemDb()
+    asyncio.run(stamp_cursor(j, cursors))
+    big = lambda i: {"verb": "put", "id": f"big-{i}", "args": {"i": i, "pad": "x" * 20_000}}
+    asyncio.run(write_unit(j, cursors, db, [big(i) for i in range(3)]))
+    assert committed_length(j) == os.path.getsize(j)
+    whole = os.path.getsize(j)
+    token = FAULT_HOOK.set(crash_at("torn_append"))
+    try:
+        with pytest.raises(Crash):
+            asyncio.run(write_unit(j, cursors, db, [big(i) for i in range(3, 6)]))
+    finally:
+        FAULT_HOOK.reset(token)
+    assert committed_length(j) == whole and len(read_journal(j)) == 3
+    with open(j, "rb") as f:  # a torn append that left only complete lines of its unit
+        head = f.read()
+    Path(j).write_bytes(head[:whole] + head[whole:head.index(b"\n", whole) + 1])
+    assert committed_length(j) == whole and len(read_journal(j)) == 3
+    cold = rotate_journal(j)  # a rotation seals the torn end before it closes the segment
+    assert [r["id"] for r in read_journal(j)] == [f"big-{i}" for i in range(3)] and cold.endswith(".xz")
+
+
+def unit_child_main(argv):  # A writer process: ONE unit of `n` puts
+    j, cursor_file, db_file, n, prefix = argv
+    cursors = FileCursors(cursor_file)
+
+    async def run():
+        async with JournalWriter(j, cursors, lambda r: _file_apply(db_file, r)) as w:
+            async with w.unit():
+                for i in range(int(n)):
+                    await w.write(put(i, prefix), dedup=False)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fault", ["torn_append", "after_append", "after_apply@2"])
+def test_a_killed_unit_writer_leaves_the_whole_unit_or_none(tmp_path, fault):
+    j, cursors = str(tmp_path / "w.jsonl"), FileCursors(tmp_path / "cursors.json")
+    asyncio.run(stamp_cursor(j, cursors))
+    env = {k: v for k, v in os.environ.items() if k != JOURNAL_FAULT_ENV}
+    env[JOURNAL_FAULT_ENV] = fault
+    code = (f"import sys; sys.path.insert(0, {str(Path(__file__).parent)!r}); "
+            f"import test_writer; test_writer.unit_child_main(sys.argv[1:])")
+    child = subprocess.Popen([sys.executable, "-c", code, j, str(tmp_path / "cursors.json"),
+                              str(tmp_path / "db.log"), "3", "u"], env=env)
+    assert child.wait(30) == FAULT_EXIT
+
+    async def heal():
+        async with JournalWriter(j, cursors, lambda r: _file_apply(str(tmp_path / "db.log"), r)) as w:
+            return w.sealed, w.healed
+
+    sealed, healed = asyncio.run(asyncio.wait_for(heal(), 5))
+    want = [] if fault == "torn_append" else ["u-0", "u-1", "u-2"]
+    assert [r["id"] for r in read_journal(j)] == want
+    assert sorted(set(_applied(tmp_path))) == want and (sealed > 0) == (fault == "torn_append")
