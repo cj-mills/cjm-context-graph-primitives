@@ -197,14 +197,84 @@ def test_a_nested_writer_joins_the_held_family(tmp_path):
     j, cursors, db = str(tmp_path / "w.jsonl"), MemCursors(), MemDb()
     asyncio.run(stamp_cursor(j, cursors))
 
+    reads = []
+    read = cursors.read
+
+    async def counted(family):
+        reads.append(family)
+        return await read(family)
+    cursors.read = counted
+
     async def nested():
         async with JournalWriter(j, cursors, db.apply) as outer:
             await outer.write(put(0))
             async with JournalWriter(j, cursors, db.apply) as inner:
+                assert inner is outer  # the same writer: one lock, one heal, one cursor
                 await inner.write(put(1))
+            await outer.write(put(2))  # the inner exit left the outer's hold intact
 
     asyncio.run(asyncio.wait_for(nested(), 5))
-    assert db.log == ["op-0", "op-1"] and cursors.held["w.jsonl"].ordinal == 2
+    assert db.log == ["op-0", "op-1", "op-2"] and cursors.held["w.jsonl"].ordinal == 3
+    assert reads == ["w.jsonl"]  # no second cursor read
+
+
+def test_a_nested_writer_on_another_db_refuses(tmp_path):
+    j, db = str(tmp_path / "w.jsonl"), MemDb()
+    a, b = MemCursors(), MemCursors()
+    asyncio.run(stamp_cursor(j, a))
+
+    async def nested():
+        async with JournalWriter(j, a, db.apply):
+            async with JournalWriter(j, b, db.apply):
+                pass
+
+    with pytest.raises(RuntimeError, match="another db"):
+        asyncio.run(asyncio.wait_for(nested(), 5))
+
+
+def test_restamp_puts_the_cursor_at_the_end_after_a_rewrite_under_the_lock(tmp_path):
+    from cjm_context_graph_primitives.journal import journal_segments, read_segment, write_segment
+    j, cursors, db = str(tmp_path / "w.jsonl"), MemCursors(), MemDb()
+    asyncio.run(stamp_cursor(j, cursors))
+    asyncio.run(write_all(j, cursors, db, [put(i) for i in range(3)]))
+    rotate_journal(j)
+    asyncio.run(write_all(j, cursors, db, [put(3)]))
+
+    async def compact():
+        async with JournalWriter(j, cursors, db.apply) as w:
+            cold = journal_segments(j)[0]  # a rewrite drops op-1 from the cold segment
+            write_segment(cold, "".join(l for l in read_segment(cold).splitlines(keepends=True)
+                                        if '"op-1"' not in l))
+            return await w.restamp()
+
+    end = asyncio.run(asyncio.wait_for(compact(), 5))
+    assert end.ordinal == 3 and cursors.held["w.jsonl"] == end and read_tail(j, end) == []
+
+
+def test_a_rotation_takes_the_family_lock_and_joins_a_held_one(tmp_path):
+    import fcntl
+    from cjm_context_graph_primitives.journal import (append_op, journal_segments, lock_path,
+                                                      maybe_rotate)
+    j, cursors, db = str(tmp_path / "w.jsonl"), MemCursors(), MemDb()
+    append_op(j, put(0))
+    fd = os.open(lock_path(j), os.O_RDWR | os.O_CREAT, 0o644)  # another holder
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        assert rotate_journal(j, wait=False) is None             # busy, not waited for
+        assert maybe_rotate(j, max_bytes=1) is None              # the budget check never waits
+        assert journal_segments(j) == [j]                        # the tail untouched
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    asyncio.run(stamp_cursor(j, cursors))
+
+    async def rotate_inside():
+        async with JournalWriter(j, cursors, db.apply) as w:
+            assert rotate_journal(j) is not None                 # joins the writer's hold
+            await w.write(put(1))
+
+    asyncio.run(asyncio.wait_for(rotate_inside(), 5))
+    assert len(journal_segments(j)) == 2 and [r["id"] for r in read_journal(j)] == ["op-0", "op-1"]
 
 
 def test_tasks_in_one_loop_apply_in_journal_order(tmp_path):

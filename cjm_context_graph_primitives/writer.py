@@ -17,20 +17,17 @@ in journal order, exactly as replay applies them (65f4a6c9 (2b)); readers never 
 Domain-free, like the journal core: the applier (a domain's per-op replay handler) and the
 cursor store (a graph store's journal cursors) are the caller's."""
 
-import asyncio
-import fcntl
 import hashlib
 import json
 import lzma
 import os
-from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple
 
-from cjm_context_graph_primitives.journal import (append_record, APPLIED_FIRST, indexed_segments,
-                                                  PROVENANCE_TS)
+from cjm_context_graph_primitives.journal import (append_record, APPLIED_FIRST, family_lock,
+                                                  indexed_segments, PROVENANCE_TS)
 
 # THE CRASH POINTS (the proof of 65f4a6c9): a test sets FAULT_HOOK (it raises, simulating the
 # crash in-process); a proof arms CJM_JOURNAL_FAULT=<point> in a child process, which then dies
@@ -42,9 +39,10 @@ FAULT_EXIT = 86  # The exit code an armed crash point dies with
 FAULT_POINTS = ("after_append", "after_apply")
 FAULT_HOOK: ContextVar[Optional[Callable[[str], None]]] = ContextVar("journal_fault_hook", default=None)
 
-# The families this context's enclosing blocks hold: a nested writer on a held family joins
-# the unit of work instead of waiting on itself.
-_HELD: ContextVar[frozenset] = ContextVar("journal_families_held", default=frozenset())
+# The writers this context's enclosing blocks have open, by family (its live tail's real path): a
+# nested writer on one of them JOINS it -- the same writer, no second cursor read, no second heal
+# (ruling 6683f49e (1)). Copied on every open, never mutated, so a sibling task never sees it.
+_OPEN: ContextVar[Dict[str, Any]] = ContextVar("journal_writers_open", default={})
 
 _ARRIVALS: Dict[str, int] = {}  # This process's arrivals per crash point (the armed <point>@<n> counts them)
 
@@ -121,12 +119,6 @@ def family_name(
     return Path(path).name
 
 
-def lock_path(
-    path: str,  # The family's live journal path
-) -> str:  # The lock file beside it (never a segment: the family's globs cannot match it)
-    return f"{path}.lock"
-
-
 def _segment_bytes(
     seg: str,       # A segment path, plain or `.xz`
     start: int = 0, # Byte offset to read from
@@ -195,45 +187,16 @@ def read_tail(
     return out
 
 
-@asynccontextmanager
-async def family_lock(
-    path: str,  # The family's live journal path
-) -> AsyncIterator[bool]:  # True when this block took the lock, False when an enclosing block holds it
-    """The family's exclusive writer lock: an flock on its own open of the lock file, so it
-    excludes every other holder -- another process, another thread, another task of this loop --
-    and dies with its process. Waited for without blocking the loop (a non-blocking try, then a
-    short sleep), so a task holding it here can run to its release. Reentrant within one context:
-    a nested writer joins the enclosing unit of work."""
-    key = os.path.realpath(path)
-    if key in _HELD.get():
-        yield False
-        return
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path(path), os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        delay = 0.002
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 0.05)
-        token = _HELD.set(_HELD.get() | {key})
-        try:
-            yield True
-        finally:
-            _HELD.reset(token)
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-
-
 class JournalWriter:
     """One writer's unit of work on one journal family (65f4a6c9): `async with` takes the
     family's lock and heals the db up to its journal; `write` appends a planned op, applies it
     and advances the cursor; the lock is released on exit. Plan INSIDE the block, so the plan
-    reads a db that holds the whole family."""
+    reads a db that holds the whole family.
+
+    A writer opened inside an open writer on the same family JOINS it (ruling 6683f49e (1)):
+    `async with` yields the OUTER writer -- one lock, one heal, one cursor -- so a core function
+    that opens its own writer composes into an app's gesture window as one unit of work. A nested
+    writer addressing another db than the one it would join refuses."""
 
     def __init__(
         self,
@@ -245,8 +208,18 @@ class JournalWriter:
         self.family = family_name(path)
         self.position: Optional[JournalPosition] = None  # The db's applied cursor while the block runs
         self.healed = 0                                   # Records the entry's heal applied
+        self._joined: Optional["JournalWriter"] = None    # The outer writer this block joined
 
     async def __aenter__(self) -> "JournalWriter":
+        key = os.path.realpath(self.path)
+        outer = _OPEN.get().get(key)
+        if outer is not None:
+            if outer.cursors != self.cursors:
+                raise RuntimeError(
+                    f"{self.family}: a nested writer addresses another db than the open writer "
+                    f"it would join -- one family, one db per unit of work")
+            self._joined = outer
+            return outer
         self._lock = family_lock(self.path)
         await self._lock.__aenter__()
         try:
@@ -254,9 +227,14 @@ class JournalWriter:
         except BaseException as e:
             await self._lock.__aexit__(type(e), e, e.__traceback__)
             raise
+        self._token = _OPEN.set({**_OPEN.get(), key: self})
         return self
 
     async def __aexit__(self, *exc) -> None:
+        if self._joined is not None:
+            self._joined = None  # the outer block owns the lock and the cursor
+            return
+        _OPEN.reset(self._token)
         await self._lock.__aexit__(*exc)
 
     async def _heal(self) -> int:  # Records applied past the cursor
@@ -315,6 +293,19 @@ class JournalWriter:
         await self._advance(JournalPosition(landed.segment, landed.offset,
                                             self.position.ordinal + 1, landed.digest))
         return landed.record
+
+    async def restamp(self) -> JournalPosition:  # The family's end, now the db's cursor
+        """Re-stamp the cursor at the family's END after a rewrite under this writer's lock moved
+        records the db already holds out of the family (a compaction, ruling 6683f49e (3)): the db
+        stood at the end before the rewrite and stands there after it; a record before the cursor
+        moved, so the cursor's ordinal -- and, when its own segment was rewritten, its place --
+        changes, never what the db has applied."""
+        if self.position is None:
+            raise RuntimeError("JournalWriter.restamp outside its `async with` block")
+        tail = read_tail(self.path, ORIGIN)
+        end = tail[-1][1] if tail else ORIGIN
+        await self._advance(end)
+        return end
 
 
 async def stamp_cursor(

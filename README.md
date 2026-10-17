@@ -33,9 +33,12 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 - `compress_cold_segments` _function_ — Compress every PLAIN cold segment of a family (the live tail is never touched).
 - `compress_segment` _function_ — Store one cold segment xz-compressed, proven lossless before the plain copy goes.
 - `current_session` _function_ — The session key stamped on journal appends (provenance, not replay input).
+- `family_lock` _function_ — The family's exclusive writer lock: an flock on its own open of the lock file, so it
+- `family_lock_sync` _function_ — `family_lock` for a synchronous family act -- a rotation (ruling 6683f49e (3)). Joins an
 - `indexed_segments` _function_ — The SEGMENT FAMILY with each segment's index: a cold segment by its NNNN, the live tail at
 - `journal_segments` _function_ — The journal's SEGMENT FAMILY: rotated cold segments + the live tail.
 - `live_index` _function_ — The live tail's place in its family: one past the highest cold index, plain or compressed.
+- `lock_path` _function_
 - `maybe_rotate` _function_ — Rotate the live tail once it reaches the budget (the POST-append check).
 - `op_clock` _function_ — Open one op's clock window: reuse an open one (replay, or an enclosing write unit),
 - `op_clocked` _function_ — Decorator form of `op_clock` for a write entry point (sync or async): every db write
@@ -108,11 +111,9 @@ The dep-light data-primitives library for the cjm context-graph ecosystem — th
 - `JournalPosition` _class_ — How far into a journal family a db has applied: the segment holding the last applied
 - `JournalWriter` _class_ — One writer's unit of work on one journal family (65f4a6c9): `async with` takes the
 - `NoCursor` _class_ — The db holds no applied cursor for a family that holds records: it predates the cursor or
-- `family_lock` _function_ — The family's exclusive writer lock: an flock on its own open of the lock file, so it
 - `family_name` _function_ — A family is keyed by its live tail's FILE NAME, never its path: a db and its journals move
 - `fault_point` _function_ — A crash-injection point on the write path: the in-process hook, then the armed env.
 - `journal_lag` _function_ — How far a db trails its journal, for a READER to report (65f4a6c9 (2d)): readers never
-- `lock_path` _function_
 - `read_tail` _function_ — Every record of the family past `position`, in append order -- only the tail is read (the
 - `stamp_cursor` _function_ — Record the family's END as the db's cursor -- for a db that holds the whole family: a
 

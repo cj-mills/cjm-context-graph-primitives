@@ -7,6 +7,8 @@ this module owns the discipline — append-on-success with exact-duplicate skip,
 append order, session stamping for provenance, and the OP CLOCK every write reads its time from.
 """
 
+import asyncio
+import fcntl
 import functools
 import hashlib
 import inspect
@@ -15,11 +17,11 @@ import lzma
 import os
 import re
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple
 
 from cjm_context_graph_primitives.timings import record_append, span, timed
 
@@ -37,6 +39,12 @@ PROVENANCE_TS: ContextVar[Optional[float]] = ContextVar("provenance_ts", default
 # it: its db already holds it, through a live path replay's applier may not reproduce. Replay
 # ignores the mark (a rebuild applies every record).
 APPLIED_FIRST = "applied_first"
+
+# THE FAMILY'S WRITER LOCK (design detail 65f4a6c9 (2b), ruling 6683f49e (3)): the families this
+# context's enclosing blocks hold. Every act that mutates a family -- a writer's unit of work, a
+# rotation, a compaction -- holds its lock; a nested act on a held family joins the enclosing
+# block instead of waiting on itself.
+_HELD: ContextVar[frozenset] = ContextVar("journal_families_held", default=frozenset())
 
 
 def op_now() -> float:  # The open window's ts, else a fresh clock read
@@ -286,7 +294,8 @@ def write_segment(
 def rotate_journal(
     path: str,             # The live journal path — its content becomes the next cold segment
     compress: bool = True, # Store the closed segment xz-compressed (ruling f1173d0b)
-) -> Optional[str]:  # The cold segment path minted, or None (missing/empty tail)
+    wait: bool = True,     # Wait for the family's lock; False: skip when another holder has it
+) -> Optional[str]:  # The cold segment path minted, or None (missing/empty tail, or the lock busy unwaited)
     """Close the live tail into the next immutable cold segment (explicit rotation).
 
     A rename, then (by default) the segment is stored compressed by `compress_segment`:
@@ -295,14 +304,21 @@ def rotate_journal(
     past the size budget via `maybe_rotate`; this explicit verb exists for migration
     splits and manual closes. Cold segments are part of the journal — the never-delete
     rule covers every segment, not just the live tail (the plain copy is removed only
-    once its compressed form is proven)."""
-    p = Path(path)
-    if not p.exists() or p.stat().st_size == 0:
-        return None
-    stem, suffix = _stem_suffix(p.name)
-    cold = p.with_name(f"{stem}.{live_index(path):04d}{suffix}")
-    p.rename(cold)
-    return compress_segment(str(cold)) if compress else str(cold)
+    once its compressed form is proven).
+
+    Under the family's lock (ruling 6683f49e (3)): a rotation renames the tail an append's landing
+    names, so it never interleaves with a writer -- inside a writer's or a compaction's block it
+    joins the hold, elsewhere it takes the lock; with `wait=False` a busy lock skips the rotation."""
+    with family_lock_sync(path, wait=wait) as held:
+        if held is None:
+            return None
+        p = Path(path)
+        if not p.exists() or p.stat().st_size == 0:
+            return None
+        stem, suffix = _stem_suffix(p.name)
+        cold = p.with_name(f"{stem}.{live_index(path):04d}{suffix}")
+        p.rename(cold)
+        return compress_segment(str(cold)) if compress else str(cold)
 
 
 @timed("compress_segment")
@@ -359,8 +375,88 @@ def maybe_rotate(
     Checked after a successful append, never before — a fat op always lands and
     merely closes its segment out oversized (graceful degradation: the durability
     net only breaks at a single op crossing the blob limit, ~75+ audio hours in
-    one source at measured spine-extension rates)."""
+    one source at measured spine-extension rates). Never waits for the family's lock: an
+    appender inside the write order holds it already (the rotation joins), and one outside it
+    skips a rotation another holder blocks -- the next append's check closes the segment."""
     p = Path(path)
     if p.exists() and p.stat().st_size >= max_bytes:
-        return rotate_journal(path)
+        return rotate_journal(path, wait=False)
     return None
+
+
+def lock_path(
+    path: str,  # The family's live journal path
+) -> str:  # The lock file beside it (never a segment: the family's globs cannot match it)
+    return f"{path}.lock"
+
+
+def _open_lock(
+    path: str,  # The family's live journal path
+) -> int:  # An fd on the family's lock file, this holder's own open of it
+    """Open the lock file a family's holders flock -- each holder its own open, so the flock
+    excludes every other holder, this process's included."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    return os.open(lock_path(path), os.O_RDWR | os.O_CREAT, 0o644)
+
+
+@asynccontextmanager
+async def family_lock(
+    path: str,  # The family's live journal path
+) -> AsyncIterator[bool]:  # True when this block took the lock, False when an enclosing block holds it
+    """The family's exclusive writer lock: an flock on its own open of the lock file, so it
+    excludes every other holder -- another process, another thread, another task of this loop --
+    and dies with its process. Waited for without blocking the loop (a non-blocking try, then a
+    short sleep), so a task holding it here can run to its release. Reentrant within one context:
+    a nested writer joins the enclosing unit of work."""
+    key = os.path.realpath(path)
+    if key in _HELD.get():
+        yield False
+        return
+    fd = _open_lock(path)
+    try:
+        delay = 0.002
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 0.05)
+        token = _HELD.set(_HELD.get() | {key})
+        try:
+            yield True
+        finally:
+            _HELD.reset(token)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def family_lock_sync(
+    path: str,          # The family's live journal path
+    wait: bool = True,  # Block until the lock is free; False: give up at once when another holder has it
+) -> Iterator[Optional[bool]]:  # True: this block took the lock; False: an enclosing block holds it; None: busy, not waited for
+    """`family_lock` for a synchronous family act -- a rotation (ruling 6683f49e (3)). Joins an
+    enclosing block's hold; else blocks on the flock, or with `wait=False` yields None at once
+    when another holder has it: the post-append budget check (`maybe_rotate`) never blocks, so
+    an appender outside the write order cannot wait on a writer of its own thread."""
+    key = os.path.realpath(path)
+    if key in _HELD.get():
+        yield False
+        return
+    fd = _open_lock(path)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield None
+            return
+        token = _HELD.set(_HELD.get() | {key})
+        try:
+            yield True
+        finally:
+            _HELD.reset(token)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
